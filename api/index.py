@@ -10,7 +10,7 @@ OPENROUTER_KEY = os.getenv("OPENROUTER_KEY")
 
 # Выбор модели. "meta-llama/llama-3.1-8b-instruct:free" — бесплатная, быстрая и отлично матерится/рофлит.
 # Если есть баланс на OpenRouter, можно поставить "openai/gpt-4o-mini"
-MODEL = "meta-llama/llama-3.3-70b-instruct:free"
+MODEL = "openai/gpt-oss-120b:free"
 
 # Базовый характер OrienAI
 BASE_RULES = (
