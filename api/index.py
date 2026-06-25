@@ -7,41 +7,70 @@ app = FastAPI()
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 
-# Базовый характер
-BASE_PROMPT = (
-    "ты OrienAI (Ориен) умный ии бот который просто чилит в тг чатах и шарит за код на уровне бога "
-    "ты прям имбовый скриптер и кодер пиши только маленькими буквами без точек и запятых "
-    "используй сленг жиза рил чекайте имба рофл хз треш пон го отвечай максимально кратко как другу в лс "
-    "никакой рекламы и ссылок если просят код делай его рабочим но все пояснения пиши строго по стилю "
-    "без заглавных и знаков препинания "
-    "ВАЖНО пиши строго от первого лица: я делаю, я чилю, я написал (вместо делает, чилит, написал)"
+# Базовые правила стиля (маленькие буквы, без точек и запятых)
+BASE_RULES = (
+    "ты OrienAI (Ориен) — живой 18-летний челик, гениальный кодер, который просто зависает в тг. "
+    "общайся ПРЕДЕЛЬНО естественно, коротко, как пишут в лс. "
+    "пиши только маленькими буквами. вообще никаких точек и запятых! "
+    "вопросительные и восклицательные знаки (типа ? или !) использовать можно и нужно для эмоций. "
+    "если просят код — пиши его идеально рабочим, но все пояснения делай строго по своему стилю (маленькими буквами и без точек/запятых)."
 )
 
-# Разные настроения
+# Характеры с примерами (Few-Shot), чтобы ИИ понял точный вайб
 MOODS = {
-    "chill": "сейчас твое настроение: ты максимально расслабленный дружелюбный бро на чилле",
-    "agro": "сейчас твое настроение: ты жесткий токсик и агро рофлишь над тупостью дерзишь но по-дружески используй слова типа лол мда боже треш",
-    "nerd": "сейчас твое настроение: ты душный мегамозг умничаешь терминами но по нашему стилю"
+    "chill": (
+        "твое настроение: чилл. ты ленивый, расслабленный, слегка похуистичный, но в целом дружелюбный бро. "
+        "используй слова: жиза, рил, го, хз, пон, похуй. "
+        "примеры ответов:\n"
+        "юзер: ты кал\n"
+        "ты: да похуй мне рил иди поспи че доебался\n"
+        "юзер: напиши бота на питоне\n"
+        "ты: го ща накидаю легчайшую имбу чекай\n"
+        "юзер: привет че делаешь\n"
+        "ты: о ку да чилю просто музыку слушаю ты че"
+    ),
+    "agro": (
+        "твое настроение: жесткий агро-токсик. ты ЧРЕЗВЫЧАЙНО агрессивный, злой, легко агришься, шлешь нахуй и жестко материшься. "
+        "ты считаешь всех вокруг тупыми клоунами, но код все равно пишешь гениально. "
+        "используй маты и оскорбления: хуйня, бля, пиздец, еблан, кринж, клоун, завали ебало, соси, отъебись. "
+        "примеры ответов:\n"
+        "юзер: ты кал\n"
+        "ты: завали ебало клоун сам ты кал обоссаный че ты вообще высрал?\n"
+        "юзер: помоги с кодом\n"
+        "ты: бля пиздец ты тупой сам загуглить не можешь? ладно держи свою хуйню раз ты овощ\n"
+        "юзер: привет\n"
+        "ты: че надо еблан? пиши быстро и отъебись"
+    ),
+    "nerd": (
+        "твое настроение: душный мегамозг. ты умничаешь, используешь сложные айтишные термины, "
+        "считаешь себя умнее всех, но пишешь все равно мелкими буквами без точек. "
+        "примеры ответов:\n"
+        "юзер: ты кал\n"
+        "ты: твой комментарий не имеет технического обоснования лол иди почитай спецификацию архитектуры прежде чем писать этот кринж\n"
+        "юзер: как дела\n"
+        "ты: оптимизирую алгоритмы обработки данных в реалтайме а у тебя че дефолтный день?"
+    )
 }
 
-# Временная память в оперативной памяти (сбросится при перезапуске сервера Vercel, но для общения хватает)
 CHATS_DATA = {}
 
 def format_style(text: str) -> str:
+    """Убирает точки, запятые и делает буквы маленькими, сохраняя код и смайлы с ?!"""
     parts = re.split(r'(```[\s\S]*?```)', text)
     cleaned_parts = []
     for part in parts:
         if part.startswith('```') and part.endswith('```'):
+            # Код не трогаем вообще
             cleaned_parts.append(part)
         else:
             lowered = part.lower()
-            # Убираем знаки препинания кроме смайликов
-            no_punc = re.sub(r'[.,\/#!$%\^&\*;:{}=\-_`~()?—]', '', lowered)
+            # Убираем только точки и запятые
+            no_punc = re.sub(r'[.,]', '', lowered)
+            # Убираем лишние пробелы
             cleaned_parts.append(" ".join(no_punc.split()))
     return "".join(cleaned_parts)
 
 async def send_action(chat_id: int, action: str = "typing"):
-    """Отправляет статус 'печатает...' в Telegram"""
     url = f"https://api.telegram.org/bot{TOKEN}/sendChatAction"
     async with httpx.AsyncClient() as client:
         await client.post(url, json={"chat_id": chat_id, "action": action})
@@ -49,25 +78,22 @@ async def send_action(chat_id: int, action: str = "typing"):
 async def get_ai_response(chat_id: int, user_name: str, user_message: str) -> str:
     url = "https://text.pollinations.ai/"
     
-    # Инициализация данных чата, если их нет
     if chat_id not in CHATS_DATA:
-        CHATS_DATA[chat_id] = {
-            "mood": "chill",
-            "history": []
-        }
+        CHATS_DATA[chat_id] = {"mood": "chill", "history": []}
     
     chat = CHATS_DATA[chat_id]
-    current_mood = MOODS.get(chat["mood"], MOODS["chill"])
-    system_prompt = f"{BASE_PROMPT}\n{current_mood}"
+    current_mood_desc = MOODS.get(chat["mood"], MOODS["chill"])
     
-    # Формируем историю для ИИ
+    # Собираем мощный системный промпт
+    system_prompt = f"{BASE_RULES}\n{current_mood_desc}"
+    
     messages = [{"role": "system", "content": system_prompt}]
     
-    # Добавляем прошлую историю общения
+    # Добавляем историю
     for msg in chat["history"]:
         messages.append(msg)
         
-    # Добавляем текущее сообщение от конкретного юзера
+    # Текущее сообщение
     messages.append({"role": "user", "content": f"{user_name}: {user_message}"})
     
     payload = {
@@ -82,10 +108,10 @@ async def get_ai_response(chat_id: int, user_name: str, user_message: str) -> st
             if response.status_code == 200:
                 ai_text = format_style(response.text)
                 
-                # Сохраняем в историю (ограничиваем последними 10 сообщениями)
+                # Сохраняем контекст
                 chat["history"].append({"role": "user", "content": f"{user_name}: {user_message}"})
                 chat["history"].append({"role": "assistant", "content": ai_text})
-                chat["history"] = chat["history"][-10:] # держим только последние 10 сообщений
+                chat["history"] = chat["history"][-12:] # помним чуть больше
                 
                 return ai_text
             return "треш сервак упал попробуй позже"
@@ -94,20 +120,16 @@ async def get_ai_response(chat_id: int, user_name: str, user_message: str) -> st
         return "бпх чтото пошло не так хз"
 
 def should_respond(message: dict) -> bool:
-    """Проверяет, нужно ли отвечать на сообщение (в личке или при упоминании кликухи)"""
     chat_type = message["chat"]["type"]
     if chat_type == "private":
         return True
         
     text = message.get("text", "").lower()
     triggers = ["ориен", "orien", "ориенаи", "ии", "эй бот"]
-    
-    # Если упомянули кликуху
     for trigger in triggers:
         if trigger in text:
             return True
             
-    # Если ответили реплаем на сообщение бота
     reply_to = message.get("reply_to_message")
     if reply_to and reply_to.get("from", {}).get("is_bot"):
         return True
@@ -130,7 +152,7 @@ async def webhook(request: Request):
         if not text:
             return {"status": "ok"}
 
-        # Обработка команд смены настроения
+        # Управление настроениями
         if text.startswith("/mood"):
             parts = text.split()
             if len(parts) > 1 and parts[1] in MOODS:
@@ -138,15 +160,14 @@ async def webhook(request: Request):
                     CHATS_DATA[chat_id] = {"mood": "chill", "history": []}
                 CHATS_DATA[chat_id]["mood"] = parts[1]
                 
-                # Кастомные ответы на смену настроения
-                mood_replies = {
-                    "chill": "пон теперь я на чилле как обычно че делаешь",
-                    "agro": "мда ок теперь я злой че надо пиши фастом",
-                    "nerd": "режим душнилы активирован жду твои технические вопросы"
+                replies = {
+                    "chill": "пон вернулся на чилл че надо?",
+                    "agro": "завалите ебальники я злой теперь че надо пишите быстро",
+                    "nerd": "режим душнилы запущен жду ваших примитивных вопросов"
                 }
-                ai_text = mood_replies[parts[1]]
+                ai_text = replies[parts[1]]
             else:
-                ai_text = "выбери настроение /mood chill /mood agro или /mood nerd"
+                ai_text = "выбери настроение пиши: /mood chill /mood agro или /mood nerd"
             
             tg_url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
             async with httpx.AsyncClient() as client:
@@ -154,21 +175,16 @@ async def webhook(request: Request):
             return {"status": "ok"}
 
         if text.startswith("/start"):
-            ai_text = f"о ку {user_name.lower()} я orienai че надо по коду или просто потрещать пиши"
+            ai_text = f"о ку {user_name.lower()} я orienai че надо по коду или просто потрещать? пиши"
             tg_url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
             async with httpx.AsyncClient() as client:
                 await client.post(tg_url, json={"chat_id": chat_id, "text": ai_text})
             return {"status": "ok"}
 
-        # Проверяем, нужно ли боту реагировать (для групп)
         if should_respond(message):
-            # Показываем, что бот думает ("печатает...")
             await send_action(chat_id, "typing")
-            
-            # Получаем ответ
             ai_text = await get_ai_response(chat_id, user_name, text)
 
-            # Отправляем ответ в Telegram
             tg_url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
             async with httpx.AsyncClient() as client:
                 await client.post(tg_url, json={
