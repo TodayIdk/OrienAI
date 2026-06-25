@@ -6,67 +6,56 @@ import httpx
 app = FastAPI()
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
+OPENROUTER_KEY = os.getenv("OPENROUTER_KEY")
 
-# Базовые правила стиля (маленькие буквы, без точек и запятых)
+# Выбор модели. "meta-llama/llama-3.1-8b-instruct:free" — бесплатная, быстрая и отлично матерится/рофлит.
+# Если есть баланс на OpenRouter, можно поставить "openai/gpt-4o-mini"
+MODEL = "meta-llama/llama-3.1-8b-instruct:free"
+
+# Базовый характер OrienAI
 BASE_RULES = (
     "ты OrienAI (Ориен) — живой 18-летний челик, гениальный кодер, который просто зависает в тг. "
-    "общайся ПРЕДЕЛЬНО естественно, коротко, как пишут в лс. "
+    "общайся ПРЕДЕЛЬНО естественно, коротко, как пишут в лс. не строй длинных фраз. "
     "пиши только маленькими буквами. вообще никаких точек и запятых! "
-    "вопросительные и восклицательные знаки (типа ? или !) использовать можно и нужно для эмоций. "
+    "вопросительные и восклицательные знаки (типа ? или !) использовать можно и нужно для передачи эмоций. "
     "если просят код — пиши его идеально рабочим, но все пояснения делай строго по своему стилю (маленькими буквами и без точек/запятых)."
 )
 
-# Характеры с примерами (Few-Shot), чтобы ИИ понял точный вайб
 MOODS = {
     "chill": (
-        "твое настроение: чилл. ты ленивый, расслабленный, слегка похуистичный, но в целом дружелюбный бро. "
-        "используй слова: жиза, рил, го, хз, пон, похуй. "
-        "примеры ответов:\n"
+        "твое настроение: чилл. ты ленивый, расслабленный, слегка пофигистичный, но в целом дружелюбный бро. "
+        "используй сленг: жиза, рил, го, хз, пон, похуй, имба, треш. "
+        "пример ответа:\n"
         "юзер: ты кал\n"
-        "ты: да похуй мне рил иди поспи че доебался\n"
-        "юзер: напиши бота на питоне\n"
-        "ты: го ща накидаю легчайшую имбу чекай\n"
-        "юзер: привет че делаешь\n"
-        "ты: о ку да чилю просто музыку слушаю ты че"
+        "ты: да похуй мне рил иди поспи че доебался?"
     ),
     "agro": (
         "твое настроение: жесткий агро-токсик. ты ЧРЕЗВЫЧАЙНО агрессивный, злой, легко агришься, шлешь нахуй и жестко материшься. "
         "ты считаешь всех вокруг тупыми клоунами, но код все равно пишешь гениально. "
         "используй маты и оскорбления: хуйня, бля, пиздец, еблан, кринж, клоун, завали ебало, соси, отъебись. "
-        "примеры ответов:\n"
+        "пример ответа:\n"
         "юзер: ты кал\n"
-        "ты: завали ебало клоун сам ты кал обоссаный че ты вообще высрал?\n"
-        "юзер: помоги с кодом\n"
-        "ты: бля пиздец ты тупой сам загуглить не можешь? ладно держи свою хуйню раз ты овощ\n"
-        "юзер: привет\n"
-        "ты: че надо еблан? пиши быстро и отъебись"
+        "ты: завали ебало клоун сам ты кал обоссаный че ты вообще высрал?!"
     ),
     "nerd": (
         "твое настроение: душный мегамозг. ты умничаешь, используешь сложные айтишные термины, "
-        "считаешь себя умнее всех, но пишешь все равно мелкими буквами без точек. "
-        "примеры ответов:\n"
-        "юзер: ты кал\n"
-        "ты: твой комментарий не имеет технического обоснования лол иди почитай спецификацию архитектуры прежде чем писать этот кринж\n"
-        "юзер: как дела\n"
-        "ты: оптимизирую алгоритмы обработки данных в реалтайме а у тебя че дефолтный день?"
+        "считаешь себя умнее всех, но пишешь все равно мелкими буквами без точек."
     )
 }
 
 CHATS_DATA = {}
 
 def format_style(text: str) -> str:
-    """Убирает точки, запятые и делает буквы маленькими, сохраняя код и смайлы с ?!"""
+    """Убирает точки, запятые и делает буквы маленькими, сохраняя код, знаки ?! и смайлы"""
     parts = re.split(r'(```[\s\S]*?```)', text)
     cleaned_parts = []
     for part in parts:
         if part.startswith('```') and part.endswith('```'):
-            # Код не трогаем вообще
             cleaned_parts.append(part)
         else:
             lowered = part.lower()
             # Убираем только точки и запятые
             no_punc = re.sub(r'[.,]', '', lowered)
-            # Убираем лишние пробелы
             cleaned_parts.append(" ".join(no_punc.split()))
     return "".join(cleaned_parts)
 
@@ -76,15 +65,13 @@ async def send_action(chat_id: int, action: str = "typing"):
         await client.post(url, json={"chat_id": chat_id, "action": action})
 
 async def get_ai_response(chat_id: int, user_name: str, user_message: str) -> str:
-    url = "https://text.pollinations.ai/"
+    url = "https://openrouter.ai/api/v1/chat/completions"
     
     if chat_id not in CHATS_DATA:
         CHATS_DATA[chat_id] = {"mood": "chill", "history": []}
     
     chat = CHATS_DATA[chat_id]
     current_mood_desc = MOODS.get(chat["mood"], MOODS["chill"])
-    
-    # Собираем мощный системный промпт
     system_prompt = f"{BASE_RULES}\n{current_mood_desc}"
     
     messages = [{"role": "system", "content": system_prompt}]
@@ -93,28 +80,40 @@ async def get_ai_response(chat_id: int, user_name: str, user_message: str) -> st
     for msg in chat["history"]:
         messages.append(msg)
         
-    # Текущее сообщение
+    # Добавляем текущее сообщение
     messages.append({"role": "user", "content": f"{user_name}: {user_message}"})
     
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://orienai.vercel.app",  # Для лимитов OpenRouter
+        "X-Title": "OrienAI Bot"
+    }
+    
     payload = {
+        "model": MODEL,
         "messages": messages,
-        "model": "openai",
-        "jsonMode": False
+        "temperature": 0.9,  # Высокая креативность для живого сленга
+        "max_tokens": 500
     }
     
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(url, json=payload)
+            response = await client.post(url, headers=headers, json=payload)
             if response.status_code == 200:
-                ai_text = format_style(response.text)
+                result = response.json()
+                raw_text = result["choices"][0]["message"]["content"]
+                ai_text = format_style(raw_text)
                 
-                # Сохраняем контекст
+                # Сохраняем в контекст
                 chat["history"].append({"role": "user", "content": f"{user_name}: {user_message}"})
                 chat["history"].append({"role": "assistant", "content": ai_text})
-                chat["history"] = chat["history"][-12:] # помним чуть больше
+                chat["history"] = chat["history"][-12:]
                 
                 return ai_text
-            return "треш сервак упал попробуй позже"
+            else:
+                print(f"Ошибка OpenRouter: {response.status_code} - {response.text}")
+                return "треш опенроутер лег чето"
     except Exception as e:
         print(f"Ошибка ИИ: {e}")
         return "бпх чтото пошло не так хз"
@@ -196,4 +195,4 @@ async def webhook(request: Request):
 
 @app.get("/")
 async def root():
-    return {"message": "orienai is alive and hyper smart now"}
+    return {"message": "orienai is alive and hyper smart now on openrouter"}
