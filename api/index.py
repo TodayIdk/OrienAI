@@ -14,23 +14,22 @@ SYSTEM_PROMPT = (
     "без заглавных и знаков препинания"
 )
 
+# Проверка токена при запуске
+if not TOKEN:
+    print("❌ КРИТИЧЕСКАЯ ОШИБКА: Переменная TELEGRAM_TOKEN не найдена в окружении!")
+else:
+    print(f"✅ Токен найден (начинается на: {TOKEN[:5]}...)")
+
 def format_style(text: str) -> str:
-    # Разделяем текст на блоки кода и обычный текст, чтобы не сломать синтаксис кода
     parts = re.split(r'(```[\s\S]*?```)', text)
     cleaned_parts = []
-    
     for part in parts:
         if part.startswith('```') and part.endswith('```'):
-            # Код оставляем как есть, чтобы он работал
             cleaned_parts.append(part)
         else:
-            # Обычный текст принудительно переводим в нижний регистр и убираем знаки препинания
             lowered = part.lower()
-            # Убираем точки, запятые, восклицательные, вопросительные знаки, двоеточия и т.д.
             no_punc = re.sub(r'[.,\/#!$%\^&\*;:{}=\-_`~()?—]', '', lowered)
-            # Убираем лишние пробелы
             cleaned_parts.append(" ".join(no_punc.split()))
-            
     return "".join(cleaned_parts)
 
 async def get_ai_response(user_message: str) -> str:
@@ -40,26 +39,27 @@ async def get_ai_response(user_message: str) -> str:
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_message}
         ],
-        "model": "openai",  # Используем дефолтную модель (обычно gpt-4o-mini)
+        "model": "openai",
         "jsonMode": False
     }
-    
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(url, json=payload)
             if response.status_code == 200:
-                raw_text = response.text
-                return format_style(raw_text)
+                return format_style(response.text)
+            print(f"❌ Ошибка Pollinations AI: {response.status_code}")
             return "треш сервак упал попробуй позже"
     except Exception as e:
-        print(f"Ошибка ИИ: {e}")
+        print(f"❌ Исключение при запросе к ИИ: {e}")
         return "бпх чтото пошло не так хз"
 
 @app.post("/webhook")
 async def webhook(request: Request):
     try:
         data = await request.json()
-    except Exception:
+        print(f"📥 Получен запрос от TG: {data}")  # Логируем всё, что прислал Telegram
+    except Exception as e:
+        print(f"❌ Ошибка парсинга JSON: {e}")
         return {"status": "bad request"}
 
     if "message" in data:
@@ -67,25 +67,28 @@ async def webhook(request: Request):
         chat_id = message["chat"]["id"]
         text = message.get("text", "")
 
-        # Не отвечаем на пустые сообщения или команды старта (хотя старт можно обработать)
         if not text:
             return {"status": "ok"}
             
         if text.startswith("/start"):
             ai_text = "о ку привет я orienai че надо по коду или просто потрещать пиши"
         else:
+            print(f"🤖 Запрос к ИИ с текстом: {text}")
             ai_text = await get_ai_response(text)
+            print(f"🤖 Ответ от ИИ подготовлен: {ai_text}")
 
         # Отправляем ответ в Telegram
         tg_url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
         async with httpx.AsyncClient() as client:
-            await client.post(tg_url, json={
+            print(f"📤 Отправка сообщения в чат {chat_id}...")
+            tg_resp = await client.post(tg_url, json={
                 "chat_id": chat_id,
                 "text": ai_text
             })
+            print(f"📩 Ответ от Telegram API: статус {tg_resp.status_code}, тело: {tg_resp.text}")
 
     return {"status": "ok"}
 
 @app.get("/")
 async def root():
-    return {"message": "orienai is alive"}
+    return {"message": f"orienai is alive. token status: {'configured' if TOKEN else 'empty'}"}
