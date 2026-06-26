@@ -1,5 +1,5 @@
 import os, re, asyncio, random, base64, urllib.parse
-import sys
+import sys, time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import FastAPI, Request
@@ -8,16 +8,18 @@ from dataclasses import dataclass
 from enum import Enum
 import httpx
 
-# Добавляем папку api/ в путь импорта
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from motor.motor_asyncio import AsyncIOMotorClient
 
 from economy import (
-    init_db, get_wallet, add_coins, spend_coins, farm, quest, daily, dice_game,
-    is_married, get_spouse_id, propose, accept_proposal, reject_proposal,
+    init_db, get_wallet, add_coins, add_diamonds, add_food,
+    spend_coins, farm, quest, daily, dice_game,
+    is_married, get_spouse_id, get_spouse_info, propose, accept_proposal, reject_proposal,
     divorce, gift_to_spouse, share_food, all_marriages, surprise,
-    remember_member, extract_target, WALLETS, MARRIAGES, CHAT_MEMBERS,
+    remember_member, extract_target, find_user_global,
+    start_heart2heart, pop_heart2heart, has_heart_pending,
+    WALLETS, MARRIAGES, CHAT_MEMBERS, PROPOSALS,
     save_wallet, save_marriages, save_members
 )
 
@@ -65,14 +67,13 @@ async def http() -> httpx.AsyncClient:
 @asynccontextmanager
 async def lifespan(app):
     global _mongo, DB
-    print("🚀 OrienAI v5.0 стартует")
+    print("🚀 OrienAI v5.1 стартует")
     try:
         _mongo = AsyncIOMotorClient(MONGO_URI, serverSelectionTimeoutMS=5000)
         DB = _mongo.OrienAI
         await DB.command("ping")
         print("✅ MongoDB подключена")
         await init_db(DB)
-        # Загружаем chat_settings
         async for doc in DB.chats.find():
             cid = doc["chat_id"]
             CHATS[cid] = {k: v for k, v in doc.items() if k not in ("_id", "chat_id")}
@@ -83,7 +84,7 @@ async def lifespan(app):
     if _http and not _http.is_closed: await _http.aclose()
     if _mongo: _mongo.close()
 
-app = FastAPI(title="OrienAI v5.0", lifespan=lifespan)
+app = FastAPI(title="OrienAI v5.1", lifespan=lifespan)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # МОДЕЛИ
@@ -135,14 +136,14 @@ PROV_STATUS: Dict[Prov, PStatus] = {p: PStatus() for p in Prov}
 class CB:
     @classmethod
     def fail(cls, p):
-        import time; s = PROV_STATUS[p]; s.fails += 1; s.last_fail = time.time()
+        s = PROV_STATUS[p]; s.fails += 1; s.last_fail = time.time()
         if s.fails >= 3: s.disabled = True
     @classmethod
     def ok(cls, p):
         s = PROV_STATUS[p]; s.fails = 0; s.disabled = False
     @classmethod
     def up(cls, p):
-        import time; s = PROV_STATUS[p]
+        s = PROV_STATUS[p]
         if not s.disabled: return True
         if time.time() - s.last_fail > 60:
             s.disabled = False; s.fails = 0; return True
@@ -365,6 +366,10 @@ def sys_prompt(chat, creator=False, friend=False):
 
 ГЛАВНОЕ: ВСЕ юзеры для тебя кореша
 
+ВАЖНО: ТЫ НЕ МОЖЕШЬ МУТИТЬ БАНИТЬ ИЛИ УДАЛЯТЬ ЛЮДЕЙ ИЗ ЧАТА
+если кто-то просит "замуть себя" "замуть его" — отвечай "у меня нет таких прав я обычный бот а не админ"
+не делай вид что мутишь и не пиши "ладно сейчас замучу" — это кринж
+
 СТИЛЬ ОБЩЕНИЯ:
 - ты КОРЕШ не ассистент. "привет чем помочь" = кринж
 - "ку" → "ку" "здарова"
@@ -372,7 +377,7 @@ def sys_prompt(chat, creator=False, friend=False):
 - {'мягкий смайлики 😊' if style == 'няшка' else 'дерзкий сленг: жиза рил хз пон имба треш база'}
 - маты {'можно: бля нахуй пиздец хуйня' if swear else 'ЗАПРЕЩЕНЫ'}
 
-ФОРМАТ ТЕКСТА (MarkdownV2):
+ФОРМАТ ТЕКСТА (Markdown):
 - маленькие буквы без точек запятых
 - *жирный* для важного
 - _курсив_ для подколов
@@ -390,7 +395,6 @@ def sys_prompt(chat, creator=False, friend=False):
     return base
 
 def fmt(text):
-    """Чистит точки/запятые в обычном тексте, сохраняет код и markdown"""
     parts = re.split(r'(```[\s\S]*?```|`[^`]+`)', text)
     out = []
     for p in parts:
@@ -398,15 +402,9 @@ def fmt(text):
             out.append(p)
         else:
             low = p.lower()
-            clean = re.sub(r'(?<![\d])[.,](?![\d])', '', low)  # не трогаем числа типа 3.14
+            clean = re.sub(r'(?<![\d])[.,](?![\d])', '', low)
             out.append(re.sub(r'\s+', ' ', clean))
     return "".join(out).strip()
-
-def md_escape(text: str) -> str:
-    """Escape для MarkdownV2 — но НЕ трогает форматтеры * _ ` ```"""
-    # Telegram MarkdownV2 требует экранировать: _ * [ ] ( ) ~ ` > # + - = | { } . ! \
-    # Но нам нужно сохранить * _ ` как форматтеры — поэтому используем обычный Markdown (parse_mode=Markdown)
-    return text  # обычный Markdown не нуждается в escape
 
 def is_self_req(p):
     return any(t in p.lower() for t in ["себя","тебя","ориен","orien","ава","аватар","автопортрет"])
@@ -421,11 +419,11 @@ async def tg(method, data):
         return r.json() if r.status_code == 200 else None
     except: return None
 
-async def send(cid, text, kb=None, parse_mode="Markdown"):
+async def send(cid, text, kb=None, parse_mode="Markdown", reply_to=None):
     d = {"chat_id": cid, "text": text}
     if parse_mode: d["parse_mode"] = parse_mode
     if kb: d["reply_markup"] = kb
-    # Если markdown сломал — пробуем без него
+    if reply_to: d["reply_to_message_id"] = reply_to
     r = await tg("sendMessage", d)
     if r and not r.get("ok") and parse_mode:
         d.pop("parse_mode", None)
@@ -443,8 +441,10 @@ async def edit_msg(cid, mid, text, kb=None):
     if kb: d["reply_markup"] = kb
     return await tg("editMessageText", d)
 
-async def answer_cb(cbid, text=""):
-    return await tg("answerCallbackQuery", {"callback_query_id": cbid, "text": text})
+async def answer_cb(cbid, text="", show_alert=False):
+    return await tg("answerCallbackQuery", {
+        "callback_query_id": cbid, "text": text, "show_alert": show_alert
+    })
 
 async def get_file_url(fid):
     r = await tg("getFile", {"file_id": fid})
@@ -465,17 +465,72 @@ async def get_avatar(uid):
         if ph and ph[0]: return ph[0][-1]["file_id"]
     return None
 
+def parse_duration(s: str) -> int:
+    """Парсит '1h' '30m' '60s' → секунды. Дефолт — 3600"""
+    if not s: return 3600
+    s = s.strip().lower()
+    m = re.match(r'(\d+)\s*([hmsdчмсд]?)', s)
+    if not m: return 3600
+    n = int(m.group(1)); u = m.group(2)
+    if u in ('h', 'ч'): return n * 3600
+    if u in ('m', 'м'): return n * 60
+    if u in ('s', 'с'): return n
+    if u in ('d', 'д'): return n * 86400
+    return n  # без юнита — считаем секундами
+
 async def mute_user(cid, uid, seconds=3600):
-    import time
+    """Реальный мут через restrictChatMember. Возвращает (ok, error_msg)"""
     until = int(time.time()) + seconds
+    r = await tg("restrictChatMember", {
+        "chat_id": cid, "user_id": uid, "until_date": until,
+        "permissions": {
+            "can_send_messages": False,
+            "can_send_audios": False,
+            "can_send_documents": False,
+            "can_send_photos": False,
+            "can_send_videos": False,
+            "can_send_video_notes": False,
+            "can_send_voice_notes": False,
+            "can_send_polls": False,
+            "can_send_other_messages": False,
+            "can_add_web_page_previews": False,
+            "can_change_info": False,
+            "can_invite_users": False,
+            "can_pin_messages": False
+        }
+    })
+    if not r: return False, "тг не ответил"
+    if r.get("ok"): return True, None
+    desc = r.get("description", "хз")
+    return False, desc
+
+async def unmute_user(cid, uid):
+    r = await tg("restrictChatMember", {
+        "chat_id": cid, "user_id": uid,
+        "permissions": {
+            "can_send_messages": True, "can_send_audios": True,
+            "can_send_documents": True, "can_send_photos": True,
+            "can_send_videos": True, "can_send_video_notes": True,
+            "can_send_voice_notes": True, "can_send_polls": True,
+            "can_send_other_messages": True, "can_add_web_page_previews": True,
+            "can_change_info": False, "can_invite_users": True,
+            "can_pin_messages": False
+        }
+    })
+    return bool(r and r.get("ok"))
+
+async def is_bot_admin(cid: int) -> bool:
+    """Проверяет является ли бот админом в чате"""
     try:
-        await tg("restrictChatMember", {
-            "chat_id": cid, "user_id": uid, "until_date": until,
-            "permissions": {"can_send_messages": False, "can_send_media_messages": False,
-                "can_send_other_messages": False, "can_add_web_page_previews": False}
-        })
-        return True
-    except: return False
+        me = await tg("getMe", {})
+        if not me or not me.get("ok"): return False
+        bot_id = me["result"]["id"]
+        r = await tg("getChatMember", {"chat_id": cid, "user_id": bot_id})
+        if not r or not r.get("ok"): return False
+        status = r["result"].get("status", "")
+        return status in ("administrator", "creator")
+    except:
+        return False
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SETTINGS KB
@@ -516,7 +571,6 @@ async def ai_response(cid, uname, umsg, img=None, creator=False, friend=False):
     else:
         msgs.append({"role": "user", "content": f"{uname}: {umsg}"})
     
-    # Vision auto-switch
     preferred = c.get("text_model", DEFAULT_TEXT_MODEL)
     if img and not TEXT_MODELS.get(preferred, TEXT_MODELS["primary"]).vision:
         preferred = "primary" if TEXT_MODELS["primary"].vision else "vision_free"
@@ -546,11 +600,6 @@ def parse_cmd(text):
     if "@" in cmd: cmd = cmd.split("@")[0]
     return cmd, parts[1].strip() if len(parts) > 1 else ""
 
-def fmt_dur(s):
-    if not s: return "?"
-    m, sec = divmod(s, 60); h, m = divmod(m, 60)
-    return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
-
 def upd_profile(cid, uid, name, text):
     PROFILES.setdefault(cid, {}).setdefault(uid, {"name": name, "messages": [], "desc": ""})
     p = PROFILES[cid][uid]
@@ -563,8 +612,67 @@ def upd_profile(cid, uid, name, text):
 async def handle_cb(cb):
     cid = cb.get("message", {}).get("chat", {}).get("id")
     mid = cb.get("message", {}).get("message_id")
+    uid = cb.get("from", {}).get("id")
+    uname = cb.get("from", {}).get("first_name", "чел")
+    d = cb.get("data", "")
     if not cid: await answer_cb(cb["id"], "ошибка"); return
-    c = chat_data(cid); s = c["settings"]; d = cb.get("data", "")
+
+    # === БРАКИ через инлайн ===
+    if d.startswith("marry_yes:"):
+        try:
+            _, from_uid_s, target_uid_s = d.split(":")
+            from_uid = int(from_uid_s); target_uid = int(target_uid_s)
+        except:
+            await answer_cb(cb["id"], "битая кнопка"); return
+        if uid != target_uid:
+            await answer_cb(cb["id"], "это не тебе предложение жди своего ❤️", show_alert=True)
+            return
+        ok, txt = await accept_proposal(cid, uid, uname)
+        await answer_cb(cb["id"], "💕" if ok else "❌")
+        if mid:
+            await edit_msg(cid, mid, txt)
+        else:
+            await send(cid, txt)
+        return
+
+    if d.startswith("marry_no:"):
+        try:
+            _, from_uid_s, target_uid_s = d.split(":")
+            target_uid = int(target_uid_s)
+        except:
+            await answer_cb(cb["id"], "битая кнопка"); return
+        if uid != target_uid:
+            await answer_cb(cb["id"], "не твоё предложение", show_alert=True)
+            return
+        txt = reject_proposal(cid, uid, uname)
+        await answer_cb(cb["id"], "💔")
+        if mid:
+            await edit_msg(cid, mid, txt)
+        else:
+            await send(cid, txt)
+        return
+
+    # === HEART2HEART через инлайн ===
+    if d.startswith("h2h:"):
+        # h2h:open или h2h:anon
+        anon = d == "h2h:anon"
+        sp_id, sp_name = get_spouse_info(cid, uid)
+        if not sp_id:
+            await answer_cb(cb["id"], "ты не в браке", show_alert=True); return
+        start_heart2heart(uid, cid, sp_id, sp_name, anon=anon)
+        await answer_cb(cb["id"], "ок жду сообщение в ЛС")
+        mode = "анонимно" if anon else "от твоего имени"
+        try:
+            await tg("sendMessage", {
+                "chat_id": uid,
+                "text": f"💌 *поговорим по душам с {sp_name}*\n\nнапиши сюда сообщение ({mode}) — я передам супругу в чат\n\n_ждать буду 10 минут_",
+                "parse_mode": "Markdown"
+            })
+        except: pass
+        return
+
+    # === НАСТРОЙКИ ===
+    c = chat_data(cid); s = c["settings"]
     if d == "s_ar": s["auto_reply"] = not s["auto_reply"]; await answer_cb(cb["id"], f"автоответы {'вкл' if s['auto_reply'] else 'выкл'}")
     elif d == "s_sw": s["allow_swear"] = not s["allow_swear"]; await answer_cb(cb["id"], f"мат {'вкл' if s['allow_swear'] else 'выкл'}")
     elif d == "s_st": s["style"] = "няшка" if s["style"] == "хам" else "хам"; await answer_cb(cb["id"], f"стиль: {s['style']}")
@@ -579,7 +687,7 @@ async def handle_cb(cb):
     elif d == "s_rh":
         c["history"] = []; await answer_cb(cb["id"], "история сброшена!")
     await save_chat(cid)
-    if mid and d != "s_pr":
+    if mid and d not in ("s_pr",):
         await edit_msg(cid, mid, "⚙️ настройки бота", settings_kb(s))
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -614,13 +722,38 @@ async def webhook(req: Request):
     text = msg.get("text") or msg.get("caption") or ""
     user = msg.get("from", {})
     uname = user.get("first_name", "бро"); uid = user.get("id", 0)
+    chat_type = msg["chat"]["type"]
     c = chat_data(cid); s = c["settings"]
 
-    # Запоминаем юзеров
     await remember_member(cid, user)
     rr_msg = msg.get("reply_to_message")
     if rr_msg and rr_msg.get("from"):
         await remember_member(cid, rr_msg["from"])
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # HEART2HEART: если юзер в ЛС и ждёт его сообщение для передачи супругу
+    # ══════════════════════════════════════════════════════════════════════════
+    if chat_type == "private" and text and has_heart_pending(uid) and not text.startswith("/"):
+        p = pop_heart2heart(uid)
+        if p:
+            target_cid = p["cid"]
+            sp_id = p["spouse_id"]; sp_name = p["spouse_name"]
+            anon = p["anon"]
+            sender_tag = "💌 _анонимное послание_" if anon else f"💌 *от {uname}*"
+            full = f"{sender_tag} → *{sp_name}*\n\n_{text}_"
+            ok = await tg("sendMessage", {
+                "chat_id": target_cid, "text": full, "parse_mode": "Markdown"
+            })
+            if ok and ok.get("ok"):
+                await send(uid, "✅ передал в чат")
+                # +5 любви супругам
+                m = is_married(target_cid, uid)
+                if m:
+                    m["love"] = min(100, m["love"] + 5)
+                    await save_marriages(target_cid)
+            else:
+                await send(uid, "❌ не смог передать (может бот не в чате)")
+            return {"status": "ok"}
 
     # Авто-коммент форварда
     is_fwd = (msg.get("sender_chat", {}).get("type") == "channel" and msg.get("is_automatic_forward", False))
@@ -642,36 +775,182 @@ async def webhook(req: Request):
     if mentions_creator(text) and not creator_flag:
         await typing(cid)
         await send(cid, f"эй *{uname}* ты чё на @{CREATOR_USERNAME} наезжаешь?? иди остынь на часик")
-        muted = await mute_user(cid, uid, 3600)
-        if muted:
-            await send(cid, f"🔇 *{uname}* в муте на час за токсик")
-            s.setdefault("muted_list", [])
-            if uid not in s["muted_list"]: s["muted_list"].append(uid)
-            await save_chat(cid)
+        if await is_bot_admin(cid):
+            ok, err = await mute_user(cid, uid, 3600)
+            if ok:
+                await send(cid, f"🔇 *{uname}* в муте на час за токсик")
+                s.setdefault("muted_list", [])
+                if uid not in s["muted_list"]: s["muted_list"].append(uid)
+                await save_chat(cid)
+            else:
+                await send(cid, f"_(хотел замутить но: {err})_")
         return {"status": "ok"}
 
     cmd, args = parse_cmd(text)
 
+    # === GRANT (только создатель) ===
+    if cmd in ("/grant", "/give", "/выдать"):
+        if not creator_flag:
+            await send(cid, "это команда только для создателя 😎"); return {"status": "ok"}
+        # формат: /grant @user coins=10000 diamonds=50 food=100
+        # или reply на юзера: /grant coins=5000
+        # или /grant me coins=99999 — себе
+        # или /grant all coins=1000 — всем в чате
+        if not args:
+            await send(cid, "*формат:*\n"
+                "`/grant @user coins=10000 diamonds=50 food=100`\n"
+                "`/grant me coins=99999`\n"
+                "`/grant all coins=1000` — всем в чате\n"
+                "или reply на юзера: `/grant coins=5000`")
+            return {"status": "ok"}
+
+        # парсим параметры key=value
+        params = {}
+        for part in args.split():
+            if "=" in part:
+                k, v = part.split("=", 1)
+                try: params[k.lower()] = int(v)
+                except: pass
+        if not params:
+            await send(cid, "укажи что выдать: `coins=N diamonds=N food=N`")
+            return {"status": "ok"}
+
+        coins_add = params.get("coins", 0)
+        dia_add = params.get("diamonds", 0) or params.get("dia", 0) or params.get("dimonds", 0)
+        food_add = params.get("food", 0)
+
+        # определяем кому
+        targets = []  # list of (target_cid, target_uid, target_name)
+        first_token = args.split()[0].lower()
+
+        if first_token == "me":
+            targets.append((cid, uid, uname))
+        elif first_token == "all":
+            for u_id, w in WALLETS.get(cid, {}).items():
+                targets.append((cid, u_id, w.get("name", "чел")))
+            if not targets:
+                # хоть себя добавим
+                targets.append((cid, uid, uname))
+        elif rr_msg and rr_msg.get("from"):
+            tu = rr_msg["from"]
+            targets.append((cid, tu["id"], tu.get("first_name", "чел")))
+        else:
+            # ищем @username
+            mm = re.search(r'@(\w+)', args)
+            if mm:
+                username = mm.group(1)
+                # сначала в этом чате
+                found = CHAT_MEMBERS.get(cid, {}).get(username.lower())
+                if found:
+                    targets.append((cid, found["id"], found["name"]))
+                else:
+                    # глобально
+                    other_cid, info = find_user_global(username)
+                    if info:
+                        targets.append((other_cid, info["id"], info["name"]))
+                    else:
+                        await send(cid, f"не нашёл @{username} нигде")
+                        return {"status": "ok"}
+            else:
+                # ни кому — себе
+                targets.append((cid, uid, uname))
+
+        results = []
+        for tcid, tuid, tname in targets:
+            if coins_add: await add_coins(tcid, tuid, coins_add, tname)
+            if dia_add: await add_diamonds(tcid, tuid, dia_add, tname)
+            if food_add: await add_food(tcid, tuid, food_add, tname)
+            results.append(tname)
+
+        parts = []
+        if coins_add: parts.append(f"`+{coins_add}` 🪙")
+        if dia_add: parts.append(f"`+{dia_add}` 💎")
+        if food_add: parts.append(f"`+{food_add}` 🍕")
+        gifted = ", ".join(parts) if parts else "ничего"
+        who = f"*{results[0]}*" if len(results) == 1 else f"*{len(results)}* челам"
+        await send(cid, f"🎁 выдал {who}: {gifted}")
+        return {"status": "ok"}
+
+    # === MUTE FIX ===
+    if cmd in ("/mute", "/мут"):
+        rr = msg.get("reply_to_message")
+        target_uid = None; target_name = None; target_user = None
+        if rr and rr.get("from"):
+            target_user = rr["from"]
+            target_uid = target_user["id"]
+            target_name = target_user.get("first_name", "чел")
+        else:
+            # ищем @username
+            mm = re.search(r'@(\w+)', args)
+            if mm:
+                un = mm.group(1)
+                found = CHAT_MEMBERS.get(cid, {}).get(un.lower())
+                if found:
+                    target_uid = found["id"]; target_name = found["name"]
+                    target_user = {"id": target_uid, "username": un}
+
+        if not target_uid:
+            await send(cid, "ответь на сообщение или укажи `@username`\n\nформат: `/mute @user 1h`")
+            return {"status": "ok"}
+
+        # парсим время
+        time_arg = ""
+        if args:
+            parts_a = args.split()
+            for p in parts_a:
+                if not p.startswith("@"):
+                    time_arg = p; break
+        seconds = parse_duration(time_arg)
+
+        if target_user and (is_creator(target_user) or is_friend(target_user)):
+            await send(cid, "не буду мутить своих"); return {"status": "ok"}
+
+        # проверка админских прав бота
+        if not await is_bot_admin(cid):
+            await send(cid, "❌ я не админ дай мне права на ограничения и попробуй снова"); return {"status": "ok"}
+
+        ok, err = await mute_user(cid, target_uid, seconds)
+        if ok:
+            mins = seconds // 60
+            time_str = f"{mins//60}ч {mins%60}м" if mins >= 60 else f"{mins}м" if mins else f"{seconds}с"
+            await send(cid, f"🔇 *{target_name}* в муте на *{time_str}*")
+            if "muted_list" not in s: s["muted_list"] = []
+            if target_uid not in s["muted_list"]:
+                s["muted_list"].append(target_uid)
+            await save_chat(cid)
+        else:
+            await send(cid, f"❌ не вышло замутить: _{err}_")
+        return {"status": "ok"}
+
+    if cmd in ("/unmute", "/размут"):
+        rr = msg.get("reply_to_message")
+        target_uid = None; target_name = None
+        if rr and rr.get("from"):
+            target_uid = rr["from"]["id"]
+            target_name = rr["from"].get("first_name", "чел")
+        else:
+            mm = re.search(r'@(\w+)', args)
+            if mm:
+                found = CHAT_MEMBERS.get(cid, {}).get(mm.group(1).lower())
+                if found:
+                    target_uid = found["id"]; target_name = found["name"]
+        if not target_uid:
+            await send(cid, "ответь или @username"); return {"status": "ok"}
+        if not await is_bot_admin(cid):
+            await send(cid, "❌ я не админ"); return {"status": "ok"}
+        ok = await unmute_user(cid, target_uid)
+        if ok:
+            if target_uid in s.get("muted_list", []):
+                s["muted_list"].remove(target_uid)
+                await save_chat(cid)
+            await send(cid, f"🔊 *{target_name}* размучен")
+        else:
+            await send(cid, "не вышло")
+        return {"status": "ok"}
+
     # === НАСТРОЙКИ ===
     if cmd == "/settings":
         await send(cid, "⚙️ *настройки бота*", settings_kb(s)); return {"status": "ok"}
-
-    if cmd == "/mute":
-        rr = msg.get("reply_to_message")
-        if rr:
-            tid = rr["from"]["id"]; tn = rr["from"].get("first_name", "чел")
-            if is_creator(rr["from"]) or is_friend(rr["from"]):
-                await send(cid, "не буду мутить своих"); return {"status": "ok"}
-            if "muted_list" not in s: s["muted_list"] = []
-            if tid not in s["muted_list"]:
-                s["muted_list"].append(tid)
-                muted = await mute_user(cid, tid, 3600)
-                await send(cid, f"ок *{tn}* в муте{'🔇' if muted else ''}")
-            else:
-                s["muted_list"].remove(tid); await send(cid, f"*{tn}* размучен")
-            await save_chat(cid)
-        else: await send(cid, "ответь на сообщение")
-        return {"status": "ok"}
 
     # === КАРТИНКИ ===
     if cmd == "/imgmodel":
@@ -845,14 +1124,14 @@ async def webhook(req: Request):
             if sp:
                 m = is_married(cid, target_uid)
                 sp_name = m["u2_name"] if m["u1"] == target_uid else m["u1_name"]
-            text = (f"💼 *кошелёк {w['name']}*\n\n"
+            text_out = (f"💼 *кошелёк {w['name']}*\n\n"
                     f"🪙 коинов: *{w['coins']}*\n"
                     f"💎 брилликов: *{w['diamonds']}*\n"
                     f"🍕 еды: *{w['food']}*\n"
                     f"📋 квестов: *{w['quests_done']}*\n"
                     f"🔥 стрик: *{w['farm_streak']}*")
-            if sp_name: text += f"\n💍 в браке с *{sp_name}*"
-            await send(cid, text)
+            if sp_name: text_out += f"\n💍 в браке с *{sp_name}*"
+            await send(cid, text_out)
         else: await send(cid, "не нашёл юзера")
         return {"status": "ok"}
 
@@ -886,7 +1165,8 @@ async def webhook(req: Request):
         target_uid, target_name = extract_target(args, msg.get("reply_to_message"), cid)
         if not target_uid:
             await send(cid, "укажи кому:\n`/brak @username` или reply"); return {"status": "ok"}
-        await send(cid, propose(cid, uid, uname, target_uid, target_name))
+        text_out, kb = propose(cid, uid, uname, target_uid, target_name)
+        await send(cid, text_out, kb=kb)
         return {"status": "ok"}
 
     if cmd in ("/yes", "/да", "/согласна", "/согласен"):
@@ -919,12 +1199,38 @@ async def webhook(req: Request):
     if cmd in ("/surprise", "/сюрприз"):
         await send(cid, await surprise(cid, uid, uname)); return {"status": "ok"}
 
-    # === ФАН (с поддержкой @username) ===
+    # === ПОГОВОРИТЬ ПО ДУШАМ ===
+    if cmd in ("/heart2heart", "/душа", "/dusha", "/h2h"):
+        sp_id, sp_name = get_spouse_info(cid, uid)
+        if not sp_id:
+            await send(cid, "ты не в браке :("); return {"status": "ok"}
+        # если в ЛС — сразу запоминаем, юзер пишет след. сообщение
+        anon = args.strip().lower() in ("anon", "анон", "анонимно")
+        if chat_type == "private":
+            start_heart2heart(uid, cid, sp_id, sp_name, anon=anon)
+            mode = "анонимно" if anon else "от твоего имени"
+            await send(cid, f"💌 ок напиши след. сообщение — передам *{sp_name}* ({mode})\nждать 10 минут")
+        else:
+            # в группе — даём кнопки которые откроют ЛС бота
+            bot_link = f"https://t.me/{BOT_USERNAME}"
+            kb = {"inline_keyboard": [[
+                {"text": "💌 написать в ЛС", "callback_data": "h2h:open"},
+                {"text": "🎭 анонимно", "callback_data": "h2h:anon"},
+            ], [
+                {"text": "↗️ открыть бота", "url": bot_link}
+            ]]}
+            await send(cid,
+                f"💌 *{uname}* хочет поговорить по душам с *{sp_name}*\n\n"
+                f"нажми кнопку → потом напиши мне в ЛС → я передам сюда\n"
+                f"_(если бот не пишет в ЛС — открой бота и нажми /start)_",
+                kb=kb)
+        return {"status": "ok"}
+
+    # === ФАН ===
     if cmd == "/roast":
         target_uid, target_name = extract_target(args, msg.get("reply_to_message"), cid)
         if not target_name:
             await send(cid, "укажи кого: `/roast @username` или reply"); return {"status": "ok"}
-        # Защита создателя/друзей
         tu = {"id": target_uid, "username": ""}
         if target_uid:
             for un, info in CHAT_MEMBERS.get(cid, {}).items():
@@ -1044,7 +1350,7 @@ async def webhook(req: Request):
         return {"status": "ok"}
 
     if cmd == "/help":
-        await send(cid, """⚡ *OrienAI v5.0*
+        await send(cid, """⚡ *OrienAI v5.1*
 
 💬 *общение:*
 `/provider /mood /settings /reset /status`
@@ -1059,23 +1365,18 @@ async def webhook(req: Request):
 `/analyze /task`
 
 👥 *юзеры:*
-`/profile /mute /creator`
+`/profile /mute @user 1h /unmute /creator`
 
 💰 *ЭКОНОМИКА:*
-`/wallet` — кошелёк (можно @user)
-`/farm` — ферма (1ч)
-`/quest` — квест (30мин)
-`/daily` — ежедневка
-`/dice 100` — казино
-`/top` — лидерборд
+`/wallet` `/farm` `/quest` `/daily`
+`/dice 100` `/top`
 
 💍 *БРАКИ:*
-`/brak @user` — предложение
-`/yes /no` — ответ
-`/divorce` — развод
-`/marriages` — все браки
+`/brak @user` (с кнопками!)
+`/yes /no /divorce /marriages`
 `/gift food/flowers/diamond/ring/car`
 `/sharefood /surprise`
+`/heart2heart` — поговорить по душам (через ЛС)
 
 🎮 *ФАН:*
 `/roast /ship /8ball /random /coin`
@@ -1102,7 +1403,7 @@ async def webhook(req: Request):
 
 @app.get("/")
 async def root():
-    return {"status": "alive", "version": "5.0", "db": "connected" if DB is not None else "off"}
+    return {"status": "alive", "version": "5.1", "db": "connected" if DB is not None else "off"}
 
 @app.get("/health")
 async def health():
