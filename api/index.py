@@ -1,5 +1,6 @@
 import os, re, asyncio, random, base64, urllib.parse
 import sys, time
+from io import BytesIO
 from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import FastAPI, Request
@@ -11,6 +12,15 @@ import httpx
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from motor.motor_asyncio import AsyncIOMotorClient
+
+# PIL для сжатия картинок (опционально)
+try:
+    from PIL import Image
+    HAS_PIL = True
+    print("✅ PIL загружен")
+except ImportError:
+    HAS_PIL = False
+    print("⚠ PIL не установлен — картинки не сжимаются")
 
 from economy import (
     init_db, get_wallet, add_coins, add_diamonds, add_food,
@@ -60,14 +70,14 @@ DB = None
 async def http() -> httpx.AsyncClient:
     global _http
     if _http is None or _http.is_closed:
-        _http = httpx.AsyncClient(timeout=httpx.Timeout(45, connect=8),
+        _http = httpx.AsyncClient(timeout=httpx.Timeout(60, connect=10),
             limits=httpx.Limits(max_connections=50, max_keepalive_connections=20), http2=True)
     return _http
 
 @asynccontextmanager
 async def lifespan(app):
     global _mongo, DB
-    print("🚀 OrienAI v5.1 стартует")
+    print("🚀 OrienAI v5.2 стартует")
     try:
         _mongo = AsyncIOMotorClient(MONGO_URI, serverSelectionTimeoutMS=5000)
         DB = _mongo.OrienAI
@@ -84,7 +94,7 @@ async def lifespan(app):
     if _http and not _http.is_closed: await _http.aclose()
     if _mongo: _mongo.close()
 
-app = FastAPI(title="OrienAI v5.1", lifespan=lifespan)
+app = FastAPI(title="OrienAI v5.2", lifespan=lifespan)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # МОДЕЛИ
@@ -105,14 +115,14 @@ class PStatus:
 TEXT_MODELS = {
     "primary": MCfg("openai/gpt-4o-mini", Prov.OPENROUTER,
         "https://openrouter.ai/api/v1/chat/completions", max_tok=4096, pri=1, vision=True),
-    "fallback_free": MCfg("meta-llama/llama-3.1-8b-instruct:free", Prov.OPENROUTER,
-        "https://openrouter.ai/api/v1/chat/completions", free=True, max_tok=2048, pri=2),
     "vision_free": MCfg("meta-llama/llama-3.2-11b-vision-instruct:free", Prov.OPENROUTER,
         "https://openrouter.ai/api/v1/chat/completions", free=True, max_tok=2048, pri=2, vision=True),
+    "fallback_free": MCfg("meta-llama/llama-3.1-8b-instruct:free", Prov.OPENROUTER,
+        "https://openrouter.ai/api/v1/chat/completions", free=True, max_tok=2048, pri=3),
     "pollinations_openai": MCfg("openai", Prov.POLLINATIONS,
-        "https://text.pollinations.ai/openai", free=True, max_tok=4096, pri=3, vision=True),
+        "https://text.pollinations.ai/openai", free=True, max_tok=4096, pri=4, vision=True),
     "pollinations_mistral": MCfg("mistral", Prov.POLLINATIONS,
-        "https://text.pollinations.ai/openai", free=True, max_tok=4096, pri=3),
+        "https://text.pollinations.ai/openai", free=True, max_tok=4096, pri=5),
 }
 
 IMG_MODELS = {
@@ -233,15 +243,40 @@ COMPLIMENTS = ["ты просто база ✨","имба респект","то�
 # ══════════════════════════════════════════════════════════════════════════════
 class AI:
     async def text(self, msgs, pref="primary", vis=False):
-        cands = [(k, v) for k, v in TEXT_MODELS.items() if (not vis) or v.vision]
-        for k, c in sorted(cands, key=lambda x: (x[0] != pref, x[1].pri)):
-            if not CB.up(c.prov): continue
+        # Если нужен vision — отсекаем не-vision модели
+        if vis:
+            cands = [(k, v) for k, v in TEXT_MODELS.items() if v.vision]
+            print(f"🖼 vision запрос, доступно моделей: {[k for k,_ in cands]}")
+        else:
+            cands = [(k, v) for k, v in TEXT_MODELS.items()]
+        
+        if not cands:
+            return "нет vision моделей доступно"
+        
+        # Сортируем: предпочитаемая первой, потом по приоритету
+        cands.sort(key=lambda x: (x[0] != pref, x[1].pri))
+        
+        last_err = None
+        for k, c in cands:
+            if not CB.up(c.prov):
+                print(f"⏭ {k}: circuit breaker")
+                continue
             try:
-                r = await (self._poll(msgs, c) if c.prov == Prov.POLLINATIONS else self._orouter(msgs, c))
-                CB.ok(c.prov); return r
+                print(f"🔄 пробую {k} (vision={c.vision})")
+                if c.prov == Prov.POLLINATIONS:
+                    r = await self._poll(msgs, c)
+                else:
+                    r = await self._orouter(msgs, c)
+                CB.ok(c.prov)
+                print(f"✅ {k} ответил, длина: {len(r)}")
+                return r
             except Exception as e:
-                print(f"❌ {k}: {e}"); CB.fail(c.prov)
-        return "все модели легли подожди"
+                last_err = e
+                err_msg = str(e)[:200]
+                print(f"❌ {k}: {type(e).__name__}: {err_msg}")
+                CB.fail(c.prov)
+        
+        return f"все модели легли подожди ({type(last_err).__name__ if last_err else 'хз'})"
 
     async def _orouter(self, msgs, c):
         async def f():
@@ -255,22 +290,45 @@ class AI:
                 "model": c.name, "messages": msgs, "temperature": 1.0,
                 "presence_penalty": 0.6, "frequency_penalty": 0.5, "max_tokens": c.max_tok
             })
-            r.raise_for_status()
-            return r.json()["choices"][0]["message"]["content"]
+            if r.status_code != 200:
+                try:
+                    body = r.json()
+                    print(f"❌ OpenRouter {r.status_code} body: {str(body)[:400]}")
+                except:
+                    print(f"❌ OpenRouter {r.status_code} text: {r.text[:300]}")
+                r.raise_for_status()
+            data = r.json()
+            if "choices" not in data or not data["choices"]:
+                raise Exception(f"empty response: {str(data)[:200]}")
+            return data["choices"][0]["message"]["content"]
         return await retry(f)
 
     async def _poll(self, msgs, c):
         async def f():
             cl = await http()
-            r = await cl.post(c.endpoint, json={
-                "messages": msgs, "model": c.name,
-                "temperature": 1.0, "presence_penalty": 0.6, "frequency_penalty": 0.5
-            })
-            r.raise_for_status()
+            payload = {
+                "messages": msgs,
+                "model": c.name,
+                "temperature": 1.0,
+                "presence_penalty": 0.6,
+                "frequency_penalty": 0.5,
+                "max_tokens": c.max_tok,
+                "private": True
+            }
+            r = await cl.post(c.endpoint, json=payload, timeout=60.0)
+            if r.status_code != 200:
+                print(f"❌ Pollinations {r.status_code}: {r.text[:300]}")
+                r.raise_for_status()
             try:
                 d = r.json()
-                return d["choices"][0]["message"]["content"] if "choices" in d else str(d)
-            except: return r.text
+                if "choices" in d and d["choices"]:
+                    return d["choices"][0]["message"]["content"]
+                return str(d)
+            except Exception:
+                txt = r.text
+                if txt and len(txt) > 5:
+                    return txt
+                raise Exception("empty pollinations response")
         return await retry(f)
 
     async def enhance_prompt(self, prompt, self_portrait=False):
@@ -370,6 +428,10 @@ def sys_prompt(chat, creator=False, friend=False):
 если кто-то просит "замуть себя" "замуть его" — отвечай "у меня нет таких прав я обычный бот а не админ"
 не делай вид что мутишь и не пиши "ладно сейчас замучу" — это кринж
 
+КАРТИНКИ: если видишь картинку — РЕАЛЬНО опиши что на ней изображено
+не пиши "не вижу" если картинка приложена — внимательно посмотри и реагируй живо
+комментируй детали персонажей цвета настроение
+
 СТИЛЬ ОБЩЕНИЯ:
 - ты КОРЕШ не ассистент. "привет чем помочь" = кринж
 - "ку" → "ку" "здарова"
@@ -386,7 +448,6 @@ def sys_prompt(chat, creator=False, friend=False):
 - используй формат активно но в меру
 
 КОД: всегда в ```python\\n...\\n``` блоках
-КАРТИНКИ: видишь и комментируешь по-живому
 ВИДЕО: можешь искать с ютуба"""
 
     if creator: base += f"\n\nсейчас пишет @{CREATOR_USERNAME} (idk) — твой создатель"
@@ -450,12 +511,46 @@ async def get_file_url(fid):
     r = await tg("getFile", {"file_id": fid})
     return f"https://api.telegram.org/file/bot{TOKEN}/{r['result']['file_path']}" if r and r.get("ok") else None
 
-async def dl_b64(url):
+async def dl_b64(url, max_size=1024):
+    """Скачивает картинку и кодирует в base64. Сжимает если есть PIL"""
     try:
-        cl = await http(); r = await cl.get(url, timeout=30.0)
-        if r.status_code == 200:
-            return f"data:{r.headers.get('content-type','image/jpeg')};base64,{base64.b64encode(r.content).decode()}"
-    except: pass
+        cl = await http()
+        r = await cl.get(url, timeout=60.0)
+        if r.status_code != 200:
+            print(f"❌ dl_b64 {r.status_code}: {url[:80]}")
+            return None
+        
+        content = r.content
+        ct = r.headers.get('content-type', 'image/jpeg').split(';')[0].strip()
+        if not ct.startswith('image/'): ct = 'image/jpeg'
+        
+        orig_size = len(content)
+        
+        # Сжатие если есть PIL и картинка больше 500KB
+        if HAS_PIL and orig_size > 500_000:
+            try:
+                img = Image.open(BytesIO(content))
+                if img.mode in ('RGBA', 'P', 'LA'):
+                    bg = Image.new('RGB', img.size, (255, 255, 255))
+                    if img.mode == 'P':
+                        img = img.convert('RGBA')
+                    bg.paste(img, mask=img.split()[-1] if img.mode in ('RGBA', 'LA') else None)
+                    img = bg
+                elif img.mode != 'RGB':
+                    img = img.convert('RGB')
+                img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+                buf = BytesIO()
+                img.save(buf, format='JPEG', quality=85, optimize=True)
+                content = buf.getvalue()
+                ct = 'image/jpeg'
+                print(f"📦 сжал {orig_size//1024}KB → {len(content)//1024}KB")
+            except Exception as e:
+                print(f"⚠ сжатие упало: {e}")
+        
+        b64 = base64.b64encode(content).decode()
+        return f"data:{ct};base64,{b64}"
+    except Exception as e:
+        print(f"❌ dl_b64 err: {e}")
     return None
 
 async def get_avatar(uid):
@@ -466,7 +561,6 @@ async def get_avatar(uid):
     return None
 
 def parse_duration(s: str) -> int:
-    """Парсит '1h' '30m' '60s' → секунды. Дефолт — 3600"""
     if not s: return 3600
     s = s.strip().lower()
     m = re.match(r'(\d+)\s*([hmsdчмсд]?)', s)
@@ -476,10 +570,9 @@ def parse_duration(s: str) -> int:
     if u in ('m', 'м'): return n * 60
     if u in ('s', 'с'): return n
     if u in ('d', 'д'): return n * 86400
-    return n  # без юнита — считаем секундами
+    return n
 
 async def mute_user(cid, uid, seconds=3600):
-    """Реальный мут через restrictChatMember. Возвращает (ok, error_msg)"""
     until = int(time.time()) + seconds
     r = await tg("restrictChatMember", {
         "chat_id": cid, "user_id": uid, "until_date": until,
@@ -520,7 +613,6 @@ async def unmute_user(cid, uid):
     return bool(r and r.get("ok"))
 
 async def is_bot_admin(cid: int) -> bool:
-    """Проверяет является ли бот админом в чате"""
     try:
         me = await tg("getMe", {})
         if not me or not me.get("ok"): return False
@@ -553,30 +645,44 @@ def should_respond(msg, s):
     if sender.get("is_bot") and sender.get("username", "").lower() != BOT_USERNAME: return False
     if msg["chat"]["type"] == "private": return True
     text = (msg.get("text") or msg.get("caption") or "").lower()
-    triggers = ["ориен", "orien", "ориенаи", "orienai", "ии", "эй бот", "бот", "ориэн", f"@{BOT_USERNAME}"]
+    triggers = ["ориен", "orien", "ориенаи", "orienai", "эй бот", "бот", "ориэн", f"@{BOT_USERNAME}"]
     if any(t in text for t in triggers): return True
     rr = msg.get("reply_to_message")
-    if rr and rr.get("from", {}).get("is_bot"):
-        if rr.get("from", {}).get("username", "").lower() == BOT_USERNAME: return True
+    if rr:
+        rr_from = rr.get("from", {})
+        if rr_from.get("is_bot") and rr_from.get("username", "").lower() == BOT_USERNAME:
+            return True
     return False
 
 async def ai_response(cid, uname, umsg, img=None, creator=False, friend=False):
     c = chat_data(cid)
     msgs = [{"role": "system", "content": sys_prompt(c, creator, friend)}]
     msgs.extend(c["history"])
+    
     if img:
-        uc = [{"type": "text", "text": f"{uname}: {umsg}" if umsg.strip() else f"{uname} кинул картинку посмотри и обсуди"}]
-        uc.append({"type": "image_url", "image_url": {"url": img}})
+        user_text = f"{uname}: {umsg}" if umsg.strip() else f"{uname} кинул картинку — посмотри внимательно опиши что видишь и дай реакцию"
+        uc = [
+            {"type": "text", "text": user_text},
+            {"type": "image_url", "image_url": {"url": img}}
+        ]
         msgs.append({"role": "user", "content": uc})
+        print(f"🖼 vision запрос: text={len(user_text)}ch, img b64 ~{len(img)//1024}KB")
     else:
         msgs.append({"role": "user", "content": f"{uname}: {umsg}"})
     
     preferred = c.get("text_model", DEFAULT_TEXT_MODEL)
-    if img and not TEXT_MODELS.get(preferred, TEXT_MODELS["primary"]).vision:
-        preferred = "primary" if TEXT_MODELS["primary"].vision else "vision_free"
+    if img:
+        pref_cfg = TEXT_MODELS.get(preferred)
+        if not pref_cfg or not pref_cfg.vision:
+            for k, v in TEXT_MODELS.items():
+                if v.vision:
+                    preferred = k
+                    print(f"🔁 переключаю на vision: {k}")
+                    break
     
     raw = await ai.text(msgs, pref=preferred, vis=img is not None)
     at = fmt(raw)
+    
     ht = f"{uname}: {umsg}" if umsg.strip() else f"{uname}: [картинка]"
     c["history"].append({"role": "user", "content": ht})
     c["history"].append({"role": "assistant", "content": at})
@@ -585,13 +691,58 @@ async def ai_response(cid, uname, umsg, img=None, creator=False, friend=False):
     return at
 
 async def extract_img(msg):
+    """Извлекает картинку из сообщения или реплая"""
     ph = None
-    if "photo" in msg: ph = msg["photo"][-1]
-    elif "reply_to_message" in msg and "photo" in msg["reply_to_message"]:
-        ph = msg["reply_to_message"]["photo"][-1]
-    if not ph: return None
+    
+    # В самом сообщении
+    if "photo" in msg and msg["photo"]:
+        ph = msg["photo"][-1]
+        print(f"🖼 фото в самом сообщении")
+    elif "sticker" in msg:
+        st = msg["sticker"]
+        if not st.get("is_animated") and not st.get("is_video"):
+            ph = {"file_id": st["file_id"]}
+            print(f"🖼 стикер статичный")
+    elif "document" in msg:
+        doc = msg["document"]
+        mime = doc.get("mime_type", "")
+        if mime.startswith("image/"):
+            ph = {"file_id": doc["file_id"]}
+            print(f"🖼 документ-картинка")
+    
+    # В реплае
+    if not ph and "reply_to_message" in msg:
+        rr = msg["reply_to_message"]
+        if "photo" in rr and rr["photo"]:
+            ph = rr["photo"][-1]
+            print(f"🖼 фото в реплае")
+        elif "sticker" in rr:
+            st = rr["sticker"]
+            if not st.get("is_animated") and not st.get("is_video"):
+                ph = {"file_id": st["file_id"]}
+                print(f"🖼 стикер в реплае")
+        elif "document" in rr:
+            doc = rr["document"]
+            mime = doc.get("mime_type", "")
+            if mime.startswith("image/"):
+                ph = {"file_id": doc["file_id"]}
+                print(f"🖼 документ-картинка в реплае")
+    
+    if not ph:
+        return None
+    
     url = await get_file_url(ph["file_id"])
-    return await dl_b64(url) if url else None
+    if not url:
+        print(f"❌ extract_img: file_url не получен")
+        return None
+    
+    b64 = await dl_b64(url)
+    if not b64:
+        print(f"❌ extract_img: b64 пустой")
+        return None
+    
+    print(f"✅ extract_img готов")
+    return b64
 
 def parse_cmd(text):
     if not text or not text.startswith("/"): return None, None
@@ -617,7 +768,6 @@ async def handle_cb(cb):
     d = cb.get("data", "")
     if not cid: await answer_cb(cb["id"], "ошибка"); return
 
-    # === БРАКИ через инлайн ===
     if d.startswith("marry_yes:"):
         try:
             _, from_uid_s, target_uid_s = d.split(":")
@@ -652,9 +802,7 @@ async def handle_cb(cb):
             await send(cid, txt)
         return
 
-    # === HEART2HEART через инлайн ===
     if d.startswith("h2h:"):
-        # h2h:open или h2h:anon
         anon = d == "h2h:anon"
         sp_id, sp_name = get_spouse_info(cid, uid)
         if not sp_id:
@@ -671,7 +819,6 @@ async def handle_cb(cb):
         except: pass
         return
 
-    # === НАСТРОЙКИ ===
     c = chat_data(cid); s = c["settings"]
     if d == "s_ar": s["auto_reply"] = not s["auto_reply"]; await answer_cb(cb["id"], f"автоответы {'вкл' if s['auto_reply'] else 'выкл'}")
     elif d == "s_sw": s["allow_swear"] = not s["allow_swear"]; await answer_cb(cb["id"], f"мат {'вкл' if s['allow_swear'] else 'выкл'}")
@@ -730,9 +877,7 @@ async def webhook(req: Request):
     if rr_msg and rr_msg.get("from"):
         await remember_member(cid, rr_msg["from"])
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # HEART2HEART: если юзер в ЛС и ждёт его сообщение для передачи супругу
-    # ══════════════════════════════════════════════════════════════════════════
+    # HEART2HEART pending
     if chat_type == "private" and text and has_heart_pending(uid) and not text.startswith("/"):
         p = pop_heart2heart(uid)
         if p:
@@ -746,7 +891,6 @@ async def webhook(req: Request):
             })
             if ok and ok.get("ok"):
                 await send(uid, "✅ передал в чат")
-                # +5 любви супругам
                 m = is_married(target_cid, uid)
                 if m:
                     m["love"] = min(100, m["love"] + 5)
@@ -755,7 +899,6 @@ async def webhook(req: Request):
                 await send(uid, "❌ не смог передать (может бот не в чате)")
             return {"status": "ok"}
 
-    # Авто-коммент форварда
     is_fwd = (msg.get("sender_chat", {}).get("type") == "channel" and msg.get("is_automatic_forward", False))
     if is_fwd and s.get("comment_posts", True):
         pt = msg.get("text") or msg.get("caption") or ""
@@ -788,23 +931,18 @@ async def webhook(req: Request):
 
     cmd, args = parse_cmd(text)
 
-    # === GRANT (только создатель) ===
+    # === GRANT ===
     if cmd in ("/grant", "/give", "/выдать"):
         if not creator_flag:
             await send(cid, "это команда только для создателя 😎"); return {"status": "ok"}
-        # формат: /grant @user coins=10000 diamonds=50 food=100
-        # или reply на юзера: /grant coins=5000
-        # или /grant me coins=99999 — себе
-        # или /grant all coins=1000 — всем в чате
         if not args:
             await send(cid, "*формат:*\n"
                 "`/grant @user coins=10000 diamonds=50 food=100`\n"
                 "`/grant me coins=99999`\n"
-                "`/grant all coins=1000` — всем в чате\n"
+                "`/grant all coins=1000`\n"
                 "или reply на юзера: `/grant coins=5000`")
             return {"status": "ok"}
 
-        # парсим параметры key=value
         params = {}
         for part in args.split():
             if "=" in part:
@@ -819,8 +957,7 @@ async def webhook(req: Request):
         dia_add = params.get("diamonds", 0) or params.get("dia", 0) or params.get("dimonds", 0)
         food_add = params.get("food", 0)
 
-        # определяем кому
-        targets = []  # list of (target_cid, target_uid, target_name)
+        targets = []
         first_token = args.split()[0].lower()
 
         if first_token == "me":
@@ -829,22 +966,18 @@ async def webhook(req: Request):
             for u_id, w in WALLETS.get(cid, {}).items():
                 targets.append((cid, u_id, w.get("name", "чел")))
             if not targets:
-                # хоть себя добавим
                 targets.append((cid, uid, uname))
         elif rr_msg and rr_msg.get("from"):
             tu = rr_msg["from"]
             targets.append((cid, tu["id"], tu.get("first_name", "чел")))
         else:
-            # ищем @username
             mm = re.search(r'@(\w+)', args)
             if mm:
                 username = mm.group(1)
-                # сначала в этом чате
                 found = CHAT_MEMBERS.get(cid, {}).get(username.lower())
                 if found:
                     targets.append((cid, found["id"], found["name"]))
                 else:
-                    # глобально
                     other_cid, info = find_user_global(username)
                     if info:
                         targets.append((other_cid, info["id"], info["name"]))
@@ -852,7 +985,6 @@ async def webhook(req: Request):
                         await send(cid, f"не нашёл @{username} нигде")
                         return {"status": "ok"}
             else:
-                # ни кому — себе
                 targets.append((cid, uid, uname))
 
         results = []
@@ -871,7 +1003,7 @@ async def webhook(req: Request):
         await send(cid, f"🎁 выдал {who}: {gifted}")
         return {"status": "ok"}
 
-    # === MUTE FIX ===
+    # === MUTE ===
     if cmd in ("/mute", "/мут"):
         rr = msg.get("reply_to_message")
         target_uid = None; target_name = None; target_user = None
@@ -880,7 +1012,6 @@ async def webhook(req: Request):
             target_uid = target_user["id"]
             target_name = target_user.get("first_name", "чел")
         else:
-            # ищем @username
             mm = re.search(r'@(\w+)', args)
             if mm:
                 un = mm.group(1)
@@ -893,11 +1024,9 @@ async def webhook(req: Request):
             await send(cid, "ответь на сообщение или укажи `@username`\n\nформат: `/mute @user 1h`")
             return {"status": "ok"}
 
-        # парсим время
         time_arg = ""
         if args:
-            parts_a = args.split()
-            for p in parts_a:
+            for p in args.split():
                 if not p.startswith("@"):
                     time_arg = p; break
         seconds = parse_duration(time_arg)
@@ -905,7 +1034,6 @@ async def webhook(req: Request):
         if target_user and (is_creator(target_user) or is_friend(target_user)):
             await send(cid, "не буду мутить своих"); return {"status": "ok"}
 
-        # проверка админских прав бота
         if not await is_bot_admin(cid):
             await send(cid, "❌ я не админ дай мне права на ограничения и попробуй снова"); return {"status": "ok"}
 
@@ -948,7 +1076,6 @@ async def webhook(req: Request):
             await send(cid, "не вышло")
         return {"status": "ok"}
 
-    # === НАСТРОЙКИ ===
     if cmd == "/settings":
         await send(cid, "⚙️ *настройки бота*", settings_kb(s)); return {"status": "ok"}
 
@@ -983,6 +1110,21 @@ async def webhook(req: Request):
             url = await ai.gen_image(ep, im)
             await send_photo(cid, url, "вот это я 😎")
         except: await send(cid, "не вышло")
+        return {"status": "ok"}
+
+    # === VISION TEST ===
+    if cmd in ("/vision", "/see", "/посмотри"):
+        img = await extract_img(msg)
+        if not img:
+            await send(cid, "кинь картинку с командой или ответь на картинку")
+            return {"status": "ok"}
+        await typing(cid)
+        prompt = args or "опиши что видишь подробно"
+        try:
+            at = await ai_response(cid, uname, prompt, img, creator_flag, friend_flag)
+            await send(cid, at)
+        except Exception as e:
+            await send(cid, f"vision упал: {str(e)[:200]}")
         return {"status": "ok"}
 
     # === ВИДЕО ===
@@ -1022,7 +1164,6 @@ async def webhook(req: Request):
         except Exception as e: await send(cid, f"ошибка: {str(e)[:80]}")
         return {"status": "ok"}
 
-    # === КОД ===
     if cmd == "/analyze":
         code = args or (msg.get("reply_to_message", {}).get("text", "") if "reply_to_message" in msg else "")
         if not code: await send(cid, "кинь код"); return {"status": "ok"}
@@ -1043,7 +1184,6 @@ async def webhook(req: Request):
             c["tasks"] = []; await save_chat(cid); await send(cid, "очищено")
         return {"status": "ok"}
 
-    # === ЮЗЕРЫ ===
     if cmd == "/getava":
         rr = msg.get("reply_to_message")
         tid = rr["from"]["id"] if rr else uid
@@ -1102,6 +1242,7 @@ async def webhook(req: Request):
             f"мат: {'✅' if s.get('allow_swear') else '❌'}",
             f"задач: *{len(c.get('tasks',[]))}*",
             f"бд: {'✅' if DB is not None else '❌'}",
+            f"PIL: {'✅' if HAS_PIL else '❌'}",
             "", "*провайдеры:*"
         ] + [f"{'✅' if not st.disabled else '❌'} `{p.value}`" for p,st in PROV_STATUS.items()]
         await send(cid, "\n".join(lines))
@@ -1199,19 +1340,16 @@ async def webhook(req: Request):
     if cmd in ("/surprise", "/сюрприз"):
         await send(cid, await surprise(cid, uid, uname)); return {"status": "ok"}
 
-    # === ПОГОВОРИТЬ ПО ДУШАМ ===
     if cmd in ("/heart2heart", "/душа", "/dusha", "/h2h"):
         sp_id, sp_name = get_spouse_info(cid, uid)
         if not sp_id:
             await send(cid, "ты не в браке :("); return {"status": "ok"}
-        # если в ЛС — сразу запоминаем, юзер пишет след. сообщение
         anon = args.strip().lower() in ("anon", "анон", "анонимно")
         if chat_type == "private":
             start_heart2heart(uid, cid, sp_id, sp_name, anon=anon)
             mode = "анонимно" if anon else "от твоего имени"
             await send(cid, f"💌 ок напиши след. сообщение — передам *{sp_name}* ({mode})\nждать 10 минут")
         else:
-            # в группе — даём кнопки которые откроют ЛС бота
             bot_link = f"https://t.me/{BOT_USERNAME}"
             kb = {"inline_keyboard": [[
                 {"text": "💌 написать в ЛС", "callback_data": "h2h:open"},
@@ -1350,13 +1488,14 @@ async def webhook(req: Request):
         return {"status": "ok"}
 
     if cmd == "/help":
-        await send(cid, """⚡ *OrienAI v5.1*
+        await send(cid, """⚡ *OrienAI v5.2*
 
 💬 *общение:*
 `/provider /mood /settings /reset /status`
 
 🎨 *картинки:*
 `/img /me /imgmodel /getava`
+`/vision` — посмотреть фото с моим описанием
 
 🎬 *ютуб:*
 `/yt /ytdl`
@@ -1376,7 +1515,7 @@ async def webhook(req: Request):
 `/yes /no /divorce /marriages`
 `/gift food/flowers/diamond/ring/car`
 `/sharefood /surprise`
-`/heart2heart` — поговорить по душам (через ЛС)
+`/heart2heart` — поговорить по душам
 
 🎮 *ФАН:*
 `/roast /ship /8ball /random /coin`
@@ -1393,18 +1532,23 @@ async def webhook(req: Request):
 
     if cmd is not None: return {"status": "ok"}
 
+    # ОБЫЧНЫЙ ОТВЕТ
     if should_respond(msg, s):
         await typing(cid)
         img = await extract_img(msg)
-        at = await ai_response(cid, uname, text, img, creator_flag, friend_flag)
-        await send(cid, at)
+        try:
+            at = await ai_response(cid, uname, text, img, creator_flag, friend_flag)
+            await send(cid, at)
+        except Exception as e:
+            print(f"❌ ai_response: {e}")
+            await send(cid, f"чёт сломался: _{str(e)[:100]}_")
 
     return {"status": "ok"}
 
 @app.get("/")
 async def root():
-    return {"status": "alive", "version": "5.1", "db": "connected" if DB is not None else "off"}
+    return {"status": "alive", "version": "5.2", "db": "connected" if DB is not None else "off", "pil": HAS_PIL}
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "db": DB is not None}
+    return {"ok": True, "db": DB is not None, "pil": HAS_PIL}
