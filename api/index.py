@@ -584,13 +584,22 @@ def detect_cringe(text):
 
 def clean_cringe(text):
     if not text: return text
-    cringe_re = r'\b(ору|жиза|база|имба|кринж|жесть|треш|рил|пон|пиздец)\b'
-    text = re.sub(rf'(?:{cringe_re}[\s,]+){{2,}}{cringe_re}?',
-                  lambda m: (re.findall(cringe_re, m.group(0), flags=re.I)[:1] or [""])[0], text, flags=re.I)
+    # Цепочки сленга → оставляем первое слово
+    cringe_words = ['ору', 'жиза', 'база', 'имба', 'кринж', 'жесть', 'треш', 'рил', 'пон', 'пиздец']
+    # Ищем 2+ кринж-слов подряд через пробел/запятую
+    cringe_alt = '|'.join(cringe_words)
+    pattern = r'\b(?:(?:' + cringe_alt + r')\b[\s,]+){2,}(?:' + cringe_alt + r')?\b?'
+    def replace_chain(m):
+        found = re.findall(r'\b(?:' + cringe_alt + r')\b', m.group(0), flags=re.I)
+        return found[0] if found else ""
+    text = re.sub(pattern, replace_chain, text, flags=re.I)
+    # Зацикленные смайлы
     text = re.sub(r'([😂🔥💯✨🤣💀😄])\1{2,}', r'\1', text)
+    # Кринж-фразы
     for p in [r'^(ну)?\s*здравствуй(те)?[,!.\s]+', r'^привет\s+дружище[,!.\s]+',
               r'^добрый день[,!.\s]+', r'^приветствую[,!.\s]+',
-              r'чем (могу |я могу )?(быть полезен|помочь)\??', r'хочешь (чтобы )?я (тебе )?помог\??',
+              r'чем (могу |я могу )?(быть полезен|помочь)\??',
+              r'хочешь (чтобы )?я (тебе )?помог\??',
               r'если (тебе )?нужна помощь', r'буду рад помочь']:
         text = re.sub(p, '', text, flags=re.I)
     return re.sub(r'\s+', ' ', text).strip()
