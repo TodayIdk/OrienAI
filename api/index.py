@@ -278,6 +278,64 @@ class AI:
         raise Exception(f"Pollinations {r.status_code}")
 
     async def search_yt(self, query):
+        """
+        Ищет видео несколькими способами:
+        1. Прямой скрейп YouTube search (HTML парсинг)
+        2. Piped API (несколько инстансов)
+        3. Invidious API (несколько инстансов)
+        4. yt-dlp если доступен
+        """
+        cl = await http()
+        
+        # === МЕТОД 1: Прямой парсинг YouTube ===
+        try:
+            search_url = f"https://www.youtube.com/results?search_query={urllib.parse.quote(query)}"
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            }
+            r = await cl.get(search_url, headers=headers, timeout=15.0, follow_redirects=True)
+            
+            if r.status_code == 200:
+                html = r.text
+                # Ищем videoId в HTML — паттерн "videoId":"XXXXXXXXXXX"
+                video_ids = re.findall(r'"videoId":"([a-zA-Z0-9_-]{11})"', html)
+                if video_ids:
+                    vid = video_ids[0]
+                    # Достаём название
+                    title_match = re.search(rf'"videoId":"{vid}".*?"title":\{{"runs":\[\{{"text":"([^"]+)"', html)
+                    title = title_match.group(1) if title_match else query
+                    # Достаём автора
+                    author_match = re.search(rf'"videoId":"{vid}".*?"longBylineText":\{{"runs":\[\{{"text":"([^"]+)"', html)
+                    author = author_match.group(1) if author_match else "?"
+                    # Достаём длительность
+                    dur_match = re.search(rf'"videoId":"{vid}".*?"lengthText":\{{[^}}]*"simpleText":"([^"]+)"', html)
+                    dur_str = dur_match.group(1) if dur_match else "0"
+                    # Парсим длительность в секунды
+                    length = 0
+                    parts = dur_str.split(":")
+                    try:
+                        if len(parts) == 2: length = int(parts[0]) * 60 + int(parts[1])
+                        elif len(parts) == 3: length = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+                    except: pass
+                    # Просмотры
+                    views_match = re.search(rf'"videoId":"{vid}".*?"viewCountText":\{{"simpleText":"([^"]+)"', html)
+                    views = views_match.group(1) if views_match else "?"
+                    
+                    print(f"✅ youtube scrape: {vid}")
+                    return {
+                        "title": title.encode().decode('unicode_escape', errors='ignore'),
+                        "author": author.encode().decode('unicode_escape', errors='ignore'),
+                        "url": f"https://www.youtube.com/watch?v={vid}",
+                        "video_id": vid,
+                        "length": length,
+                        "views": views,
+                    }
+        except Exception as e:
+            print(f"❌ youtube scrape: {e}")
+        
+        # === МЕТОД 2: yt-dlp если есть ===
         try:
             import yt_dlp
             opts = {'quiet': True, 'no_warnings': True, 'skip_download': True,
@@ -297,31 +355,81 @@ class AI:
                             "views": v.get("view_count", 0),
                         }
                 return None
-            return await loop.run_in_executor(None, _search)
+            result = await loop.run_in_executor(None, _search)
+            if result:
+                print(f"✅ yt-dlp: {result['video_id']}")
+                return result
         except Exception as e:
-            print(f"❌ yt-dlp search: {e}")
-
-        cl = await http()
-        for inst in ["https://pipedapi.kavin.rocks", "https://pipedapi.r4fo.com"]:
+            print(f"❌ yt-dlp: {e}")
+        
+        # === МЕТОД 3: Piped API ===
+        piped_instances = [
+            "https://pipedapi.kavin.rocks",
+            "https://pipedapi.adminforge.de",
+            "https://pipedapi.smnz.de",
+            "https://pipedapi.darkness.services",
+            "https://api-piped.mha.fi",
+            "https://piped-api.privacy.com.de",
+        ]
+        for inst in piped_instances:
             try:
-                r = await cl.get(f"{inst}/search?q={urllib.parse.quote(query)}&filter=videos", timeout=15.0)
+                url = f"{inst}/search?q={urllib.parse.quote(query)}&filter=videos"
+                r = await cl.get(url, timeout=12.0)
                 if r.status_code == 200:
-                    items = r.json().get("items", [])
+                    data = r.json()
+                    items = data.get("items", []) if isinstance(data, dict) else data
                     if items:
                         v = items[0]
                         vid_path = v.get("url", "")
                         vid = vid_path.replace("/watch?v=", "") if "/watch?v=" in vid_path else ""
-                        return {
-                            "title": v.get("title", "?"),
-                            "author": v.get("uploaderName", "?"),
-                            "url": f"https://youtube.com{vid_path}" if vid_path.startswith("/") else vid_path,
-                            "video_id": vid,
-                            "length": v.get("duration", 0),
-                            "views": v.get("views", 0)
-                        }
-            except: continue
+                        if vid:
+                            print(f"✅ piped: {vid}")
+                            return {
+                                "title": v.get("title", "?"),
+                                "author": v.get("uploaderName", v.get("uploader", "?")),
+                                "url": f"https://www.youtube.com/watch?v={vid}",
+                                "video_id": vid,
+                                "length": v.get("duration", 0),
+                                "views": v.get("views", 0)
+                            }
+            except Exception as e:
+                print(f"❌ piped {inst}: {e}")
+                continue
+        
+        # === МЕТОД 4: Invidious ===
+        inv_instances = [
+            "https://invidious.privacyredirect.com",
+            "https://inv.nadeko.net",
+            "https://invidious.protokolla.fi",
+            "https://invidious.f5.si",
+            "https://invidious.private.coffee",
+            "https://yewtu.be",
+        ]
+        for inst in inv_instances:
+            try:
+                url = f"{inst}/api/v1/search?q={urllib.parse.quote(query)}&type=video"
+                r = await cl.get(url, timeout=12.0)
+                if r.status_code == 200:
+                    res = r.json()
+                    if res:
+                        v = res[0]
+                        vid = v.get("videoId", "")
+                        if vid:
+                            print(f"✅ invidious: {vid}")
+                            return {
+                                "title": v.get("title", "?"),
+                                "author": v.get("author", "?"),
+                                "url": f"https://www.youtube.com/watch?v={vid}",
+                                "video_id": vid,
+                                "length": v.get("lengthSeconds", 0),
+                                "views": v.get("viewCount", 0)
+                            }
+            except Exception as e:
+                print(f"❌ invidious {inst}: {e}")
+                continue
+        
         return None
-
+                                                                              
     async def download_yt(self, video_url, max_mb=50):
         """
         Качает видео через cobalt.tools API
