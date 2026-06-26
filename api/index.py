@@ -1,1243 +1,767 @@
-import os
-import re
-import json
-import asyncio
-import random
-import base64
-import urllib.parse
+import os, re, asyncio, random, base64, urllib.parse
+from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import FastAPI, Request
-from typing import Optional, Dict, Any, List
-from dataclasses import dataclass, field
+from typing import Optional, Dict, Any
+from dataclasses import dataclass
 from enum import Enum
 import httpx
-
-app = FastAPI(title="OrienAI v4.1")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # КОНФИГ
 # ══════════════════════════════════════════════════════════════════════════════
-
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENROUTER_KEY = os.getenv("OPENROUTER_KEY")
 DEFAULT_TEXT_MODEL = os.getenv("DEFAULT_TEXT_MODEL", "primary")
 DEFAULT_IMAGE_MODEL = os.getenv("DEFAULT_IMAGE_MODEL", "flux")
-BOT_USERNAME = os.getenv("BOT_USERNAME", "Orien_ai_bot").lower()
+BOT_USERNAME = os.getenv("BOT_USERNAME", "orien_ai_bot").lower()
 
-# ══════════════════════════════════════════════════════════════════════════════
-# АВА ОРИЕНА
-# ══════════════════════════════════════════════════════════════════════════════
+# СОЗДАТЕЛЬ И ДРУЗЬЯ
+CREATOR_USERNAME = "idkxazei"
+CREATOR_USER_IDS = []
+FRIENDS = {"tosterok1488": "тостер — бро создателя и крутой чел"}
 
+# АВА
 BOT_AVATAR_PATH = Path(__file__).parent / "bot.png"
-
 ORIEN_SELF_DESCRIPTION = (
-    "anime style boy, 18 years old, messy dark hair with slight blue highlights, "
-    "wearing black hoodie, headphones around neck, cyberpunk neon city background, "
-    "expressive amber eyes, confident cocky smirk, young hacker programmer aesthetic"
+    "anime style boy, 18 years old, messy dark hair with blue highlights, "
+    "black hoodie, headphones around neck, cyberpunk neon city, "
+    "amber eyes, confident cocky smirk, young hacker aesthetic"
 )
-
 BOT_AVATAR_BASE64 = None
 if BOT_AVATAR_PATH.exists():
     try:
-        with open(BOT_AVATAR_PATH, "rb") as f:
-            BOT_AVATAR_BASE64 = base64.b64encode(f.read()).decode("utf-8")
-        print(f"✅ Ава загружена: {BOT_AVATAR_PATH}")
-    except Exception as e:
-        print(f"⚠️ bot.png error: {e}")
+        BOT_AVATAR_BASE64 = base64.b64encode(BOT_AVATAR_PATH.read_bytes()).decode()
+        print("✅ Ава загружена")
+    except: pass
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LIFESPAN + HTTP CLIENT
+# ══════════════════════════════════════════════════════════════════════════════
+_http: Optional[httpx.AsyncClient] = None
+
+async def http() -> httpx.AsyncClient:
+    global _http
+    if _http is None or _http.is_closed:
+        _http = httpx.AsyncClient(timeout=httpx.Timeout(45, connect=8),
+            limits=httpx.Limits(max_connections=50, max_keepalive_connections=20), http2=True)
+    return _http
+
+@asynccontextmanager
+async def lifespan(app):
+    print("🚀 OrienAI v4.2")
+    yield
+    if _http and not _http.is_closed: await _http.aclose()
+
+app = FastAPI(title="OrienAI v4.2", lifespan=lifespan)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # МОДЕЛИ
 # ══════════════════════════════════════════════════════════════════════════════
-
-class ModelProvider(Enum):
+class Prov(Enum):
     OPENROUTER = "openrouter"
     POLLINATIONS = "pollinations"
 
 @dataclass
-class ModelConfig:
-    name: str
-    provider: ModelProvider
-    endpoint: str
-    is_free: bool = False
-    max_tokens: int = 4096
-    priority: int = 1
-    supports_vision: bool = False
+class MCfg:
+    name: str; prov: Prov; endpoint: str
+    free: bool = False; max_tok: int = 4096; pri: int = 1; vision: bool = False
 
 @dataclass
-class ProviderStatus:
-    failures: int = 0
-    last_failure: float = 0
-    is_disabled: bool = False
+class PStatus:
+    fails: int = 0; last_fail: float = 0; disabled: bool = False
 
-TEXT_MODELS: Dict[str, ModelConfig] = {
-    "primary": ModelConfig(
-        name="openai/gpt-4o-mini",
-        provider=ModelProvider.OPENROUTER,
-        endpoint="https://openrouter.ai/api/v1/chat/completions",
-        max_tokens=4096, priority=1, supports_vision=True
-    ),
-    "fallback_free": ModelConfig(
-        name="meta-llama/llama-3.1-8b-instruct:free",
-        provider=ModelProvider.OPENROUTER,
-        endpoint="https://openrouter.ai/api/v1/chat/completions",
-        is_free=True, max_tokens=2048, priority=2
-    ),
-    "vision_free": ModelConfig(
-        name="meta-llama/llama-3.2-11b-vision-instruct:free",
-        provider=ModelProvider.OPENROUTER,
-        endpoint="https://openrouter.ai/api/v1/chat/completions",
-        is_free=True, max_tokens=2048, priority=2, supports_vision=True
-    ),
-    "pollinations_openai": ModelConfig(
-        name="openai",
-        provider=ModelProvider.POLLINATIONS,
-        endpoint="https://text.pollinations.ai/openai",
-        is_free=True, max_tokens=4096, priority=3, supports_vision=True
-    ),
-    "pollinations_mistral": ModelConfig(
-        name="mistral",
-        provider=ModelProvider.POLLINATIONS,
-        endpoint="https://text.pollinations.ai/openai",
-        is_free=True, max_tokens=4096, priority=3
-    ),
+TEXT_MODELS = {
+    "primary": MCfg("openai/gpt-4o-mini", Prov.OPENROUTER,
+        "https://openrouter.ai/api/v1/chat/completions", max_tok=4096, pri=1, vision=True),
+    "fallback_free": MCfg("meta-llama/llama-3.1-8b-instruct:free", Prov.OPENROUTER,
+        "https://openrouter.ai/api/v1/chat/completions", free=True, max_tok=2048, pri=2),
+    "vision_free": MCfg("meta-llama/llama-3.2-11b-vision-instruct:free", Prov.OPENROUTER,
+        "https://openrouter.ai/api/v1/chat/completions", free=True, max_tok=2048, pri=2, vision=True),
+    "pollinations_openai": MCfg("openai", Prov.POLLINATIONS,
+        "https://text.pollinations.ai/openai", free=True, max_tok=4096, pri=3, vision=True),
+    "pollinations_mistral": MCfg("mistral", Prov.POLLINATIONS,
+        "https://text.pollinations.ai/openai", free=True, max_tok=4096, pri=3),
 }
 
-IMAGE_MODELS: Dict[str, Dict[str, Any]] = {
-    "flux": {"name": "flux", "label": "Flux (универсал)", "width": 1024, "height": 1024},
-    "nanobanana": {"name": "nanobanana", "label": "NanoBanana", "width": 1024, "height": 1024},
-    "nanobanana-2": {"name": "nanobanana-2", "label": "NanoBanana 2", "width": 1024, "height": 1024},
-    "nanobanana-pro": {"name": "nanobanana-pro", "label": "NanoBanana Pro", "width": 1024, "height": 1024},
-    "turbo": {"name": "turbo", "label": "Turbo (быстрая)", "width": 1024, "height": 1024},
-    "kontext": {"name": "kontext", "label": "FLUX.1 Kontext", "width": 1024, "height": 1024},
-    "seedream": {"name": "seedream", "label": "Seedream", "width": 1024, "height": 1024},
+IMG_MODELS = {
+    "flux": {"name": "flux", "label": "Flux"}, "nanobanana": {"name": "nanobanana", "label": "NanoBanana"},
+    "nanobanana-2": {"name": "nanobanana-2", "label": "NanoBanana 2"},
+    "nanobanana-pro": {"name": "nanobanana-pro", "label": "NanoBanana Pro"},
+    "turbo": {"name": "turbo", "label": "Turbo"}, "kontext": {"name": "kontext", "label": "Kontext"},
+    "seedream": {"name": "seedream", "label": "Seedream"},
 }
 
-PROVIDER_TO_TEXT_MODEL = {
-    "openrouter": "primary",
-    "openrouter_free": "fallback_free",
-    "vision_free": "vision_free",
-    "pollinations": "pollinations_openai",
-    "pollinations_mistral": "pollinations_mistral",
-}
+PROV_MAP = {"openrouter": "primary", "openrouter_free": "fallback_free", "vision_free": "vision_free",
+    "pollinations": "pollinations_openai", "pollinations_mistral": "pollinations_mistral"}
 
-PROVIDER_STATUS: Dict[ModelProvider, ProviderStatus] = {
-    p: ProviderStatus() for p in ModelProvider
-}
+PROV_STATUS: Dict[Prov, PStatus] = {p: PStatus() for p in Prov}
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CIRCUIT BREAKER
+# CIRCUIT BREAKER + RETRY
 # ══════════════════════════════════════════════════════════════════════════════
-
-class CircuitBreaker:
-    FAILURE_THRESHOLD = 3
-    RECOVERY_TIMEOUT = 60
-
+class CB:
     @classmethod
-    def record_failure(cls, provider: ModelProvider):
-        import time
-        s = PROVIDER_STATUS[provider]
-        s.failures += 1
-        s.last_failure = time.time()
-        if s.failures >= cls.FAILURE_THRESHOLD:
-            s.is_disabled = True
-
+    def fail(cls, p):
+        import time; s = PROV_STATUS[p]; s.fails += 1; s.last_fail = time.time()
+        if s.fails >= 3: s.disabled = True
     @classmethod
-    def record_success(cls, provider: ModelProvider):
-        s = PROVIDER_STATUS[provider]
-        s.failures = 0
-        s.is_disabled = False
-
+    def ok(cls, p): s = PROV_STATUS[p]; s.fails = 0; s.disabled = False
     @classmethod
-    def is_available(cls, provider: ModelProvider) -> bool:
-        import time
-        s = PROVIDER_STATUS[provider]
-        if not s.is_disabled:
-            return True
-        if time.time() - s.last_failure > cls.RECOVERY_TIMEOUT:
-            s.is_disabled = False
-            s.failures = 0
-            return True
+    def up(cls, p):
+        import time; s = PROV_STATUS[p]
+        if not s.disabled: return True
+        if time.time() - s.last_fail > 60: s.disabled = False; s.fails = 0; return True
         return False
 
-async def retry_with_backoff(coro_func, max_retries=2, base_delay=0.5, max_delay=5.0):
-    last_exc = None
-    for attempt in range(max_retries):
-        try:
-            return await coro_func()
-        except (httpx.TimeoutException, httpx.HTTPStatusError) as e:
-            last_exc = e
-            if isinstance(e, httpx.HTTPStatusError) and e.response.status_code not in [429, 502, 503, 504]:
-                raise
-            delay = min(base_delay * (2 ** attempt) + random.uniform(0, 0.5), max_delay)
-            await asyncio.sleep(delay)
+async def retry(fn, tries=2):
+    for i in range(tries):
+        try: return await fn()
         except Exception as e:
-            last_exc = e
-            if attempt < max_retries - 1:
-                await asyncio.sleep(base_delay)
-    raise last_exc
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ФАН-КОНТЕНТ
-# ══════════════════════════════════════════════════════════════════════════════
-
-ROAST_PROMPTS = [
-    "жёстко но по-доброму прожарь этого чела как кореш на сходке",
-    "сделай комплимент-обзывалку в стиле 'ты конечно дебил но я тебя люблю'",
-    "опиши его как персонажа из аниме которого все ненавидят но он милый",
-]
-
-SHIP_REACTIONS = [
-    "имба пара 💕", "кринж", "топ оф зе топ", "ну такое",
-    "судьба бля", "разойдутся через неделю", "база рилейшн",
-    "вечная любовь по версии тиктока", "хз чет странно", "ору сочетание"
-]
-
-EIGHTBALL_ANSWERS = [
-    "да хз спроси у мамы", "100% да бля", "нет даже не думай",
-    "ну попробуй че терять то", "судьба так решила", "не сегодня бро",
-    "звёзды говорят да", "ой ну нахуй такие вопросы", "база делай",
-    "не советую честно", "вселенная против", "го сделай это сейчас же"
-]
-
-COMPLIMENTS = [
-    "ты сегодня просто база ✨", "имба чел респект",
-    "топ за свой кэш", "красава держи краба 🤝",
-    "ты как кофе с утра — нужен всем", "огонь не выгорай",
-]
+            if i < tries - 1: await asyncio.sleep(0.5 * (2 ** i) + random.uniform(0, 0.5))
+            else: raise e
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ДАННЫЕ ЧАТОВ
 # ══════════════════════════════════════════════════════════════════════════════
+DEF_SETTINGS = {"auto_reply": True, "allow_swear": True, "style": "хам",
+    "comment_posts": True, "mute_users": False, "muted_list": [], "mute_timers": {}}
+CHATS: Dict[int, Dict] = {}
+PROFILES: Dict[int, Dict[int, Dict]] = {}
+AVATARS: Dict[int, str] = {}
 
-DEFAULT_SETTINGS = {
-    "auto_reply": True,
-    "allow_swear": True,
-    "style": "хам",
-    "comment_posts": True,
-    "mute_users": False,
-    "muted_list": [],
-}
-
-CHATS_DATA: Dict[int, Dict[str, Any]] = {}
-USER_PROFILES: Dict[int, Dict[int, Dict[str, Any]]] = {}
-USER_AVATARS: Dict[int, str] = {}
-
-def get_chat_data(chat_id: int) -> Dict[str, Any]:
-    if chat_id not in CHATS_DATA:
-        CHATS_DATA[chat_id] = {
-            "mood": "chill",
-            "history": [],
-            "text_model": DEFAULT_TEXT_MODEL,
-            "image_model": DEFAULT_IMAGE_MODEL,
-            "settings": dict(DEFAULT_SETTINGS),
-            "tasks": [],
-        }
-    if "settings" not in CHATS_DATA[chat_id]:
-        CHATS_DATA[chat_id]["settings"] = dict(DEFAULT_SETTINGS)
-    if "tasks" not in CHATS_DATA[chat_id]:
-        CHATS_DATA[chat_id]["tasks"] = []
-    return CHATS_DATA[chat_id]
+def chat_data(cid):
+    if cid not in CHATS:
+        CHATS[cid] = {"mood": "chill", "history": [], "text_model": DEFAULT_TEXT_MODEL,
+            "image_model": DEFAULT_IMAGE_MODEL, "settings": dict(DEF_SETTINGS), "tasks": []}
+    c = CHATS[cid]
+    for k, v in DEF_SETTINGS.items():
+        if k not in c.get("settings", {}): c.setdefault("settings", {})[k] = v
+    if "tasks" not in c: c["tasks"] = []
+    return c
 
 # ══════════════════════════════════════════════════════════════════════════════
-# HTTP CLIENT (оптимизированный)
+# CREATOR/FRIEND HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
+def is_creator(u: dict) -> bool:
+    un = (u.get("username") or "").lower(); uid = u.get("id", 0)
+    if un == CREATOR_USERNAME.lower():
+        if uid and uid not in CREATOR_USER_IDS: CREATOR_USER_IDS.append(uid)
+        return True
+    return uid in CREATOR_USER_IDS
 
-_http_client: Optional[httpx.AsyncClient] = None
+def is_friend(u: dict) -> bool:
+    return (u.get("username") or "").lower() in [f.lower() for f in FRIENDS]
 
-async def get_http_client() -> httpx.AsyncClient:
-    global _http_client
-    if _http_client is None or _http_client.is_closed:
-        _http_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(45.0, connect=8.0),
-            limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
-            http2=True
-        )
-    return _http_client
+def is_vip(u: dict) -> bool:
+    return is_creator(u) or is_friend(u)
 
-@app.on_event("shutdown")
-async def shutdown():
-    global _http_client
-    if _http_client and not _http_client.is_closed:
-        await _http_client.aclose()
+def mentions_creator(text: str) -> bool:
+    bad = ["дурак", "тупой", "лох", "идиот", "дебил", "кал", "мусор", "урод",
+           "сука", "пидор", "хуй", "бля", "нахуй", "еблан", "даун", "клоун", "чмо",
+           "говно", "шлюха", "тварь", "пёс", "пес", "собака"]
+    low = text.lower()
+    has_creator = any(t in low for t in [CREATOR_USERNAME.lower(), "idk", "создатель", "создателя", "батя", "хозяин"])
+    has_insult = any(b in low for b in bad)
+    return has_creator and has_insult
 
 # ══════════════════════════════════════════════════════════════════════════════
-# AI КЛИЕНТ
+# FUN DATA
 # ══════════════════════════════════════════════════════════════════════════════
+ROAST_PROMPTS = ["жёстко но по-доброму прожарь чела", "сделай комплимент-обзывалку",
+    "опиши его как аниме персонажа которого все ненавидят но он милый"]
+SHIP_REACTIONS = ["имба пара 💕", "кринж", "топ", "ну такое", "судьба бля",
+    "разойдутся через неделю", "база", "вечная любовь", "странно", "ору"]
+BALL_ANSWERS = ["да хз спроси у мамы", "100% да бля", "нет даже не думай",
+    "попробуй че терять", "судьба решила", "не сегодня бро", "звёзды говорят да",
+    "нахуй такие вопросы", "база делай", "не советую", "вселенная против", "го сейчас же"]
+COMPLIMENTS = ["ты просто база ✨", "имба респект", "топ за свой кэш",
+    "красава 🤝", "ты как кофе с утра — нужен всем", "огонь не выгорай"]
 
-class AIClient:
-    async def get_text_response(self, messages: list, preferred_model: str = "primary", need_vision: bool = False) -> str:
-        candidates = [(k, v) for k, v in TEXT_MODELS.items() if (not need_vision) or v.supports_vision]
-        models_to_try = sorted(candidates, key=lambda x: (x[0] != preferred_model, x[1].priority))
-
-        for model_key, config in models_to_try:
-            if not CircuitBreaker.is_available(config.provider):
-                continue
+# ══════════════════════════════════════════════════════════════════════════════
+# AI CLIENT
+# ══════════════════════════════════════════════════════════════════════════════
+class AI:
+    async def text(self, msgs, pref="primary", vis=False):
+        cands = [(k, v) for k, v in TEXT_MODELS.items() if (not vis) or v.vision]
+        for k, c in sorted(cands, key=lambda x: (x[0] != pref, x[1].pri)):
+            if not CB.up(c.prov): continue
             try:
-                if config.provider == ModelProvider.POLLINATIONS:
-                    result = await self._call_pollinations(messages, config)
-                else:
-                    result = await self._call_openrouter(messages, config)
-                CircuitBreaker.record_success(config.provider)
-                return result
+                r = await (self._poll(msgs, c) if c.prov == Prov.POLLINATIONS else self._orouter(msgs, c))
+                CB.ok(c.prov); return r
             except Exception as e:
-                print(f"❌ {model_key}: {e}")
-                CircuitBreaker.record_failure(config.provider)
-                continue
-        return "все модели легли подожди минутку"
+                print(f"❌ {k}: {e}"); CB.fail(c.prov)
+        return "все модели легли подожди"
 
-    async def _call_openrouter(self, messages: list, config: ModelConfig) -> str:
-        async def _req():
-            client = await get_http_client()
-            r = await client.post(config.endpoint, headers={
-                "Authorization": f"Bearer {OPENROUTER_KEY}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "https://orienai.vercel.app",
-                "X-Title": "OrienAI"
-            }, json={
-                "model": config.name, "messages": messages,
-                "temperature": 1.0, "presence_penalty": 0.6,
-                "frequency_penalty": 0.5, "max_tokens": config.max_tokens
-            })
-            r.raise_for_status()
-            return r.json()["choices"][0]["message"]["content"]
-        return await retry_with_backoff(_req)
+    async def _orouter(self, msgs, c):
+        async def f():
+            cl = await http()
+            r = await cl.post(c.endpoint, headers={"Authorization": f"Bearer {OPENROUTER_KEY}",
+                "Content-Type": "application/json", "HTTP-Referer": "https://orienai.vercel.app", "X-Title": "OrienAI"},
+                json={"model": c.name, "messages": msgs, "temperature": 1.0,
+                    "presence_penalty": 0.6, "frequency_penalty": 0.5, "max_tokens": c.max_tok})
+            r.raise_for_status(); return r.json()["choices"][0]["message"]["content"]
+        return await retry(f)
 
-    async def _call_pollinations(self, messages: list, config: ModelConfig) -> str:
-        async def _req():
-            client = await get_http_client()
-            r = await client.post(config.endpoint, json={
-                "messages": messages, "model": config.name,
-                "temperature": 1.0, "presence_penalty": 0.6, "frequency_penalty": 0.5
-            })
+    async def _poll(self, msgs, c):
+        async def f():
+            cl = await http()
+            r = await cl.post(c.endpoint, json={"messages": msgs, "model": c.name,
+                "temperature": 1.0, "presence_penalty": 0.6, "frequency_penalty": 0.5})
             r.raise_for_status()
             try:
-                data = r.json()
-                if "choices" in data:
-                    return data["choices"][0]["message"]["content"]
-                return str(data)
-            except Exception:
-                return r.text
-        return await retry_with_backoff(_req)
+                d = r.json()
+                return d["choices"][0]["message"]["content"] if "choices" in d else str(d)
+            except: return r.text
+        return await retry(f)
 
-    async def enhance_image_prompt(self, user_prompt: str, is_self_portrait: bool = False) -> str:
-        system = (
-            "ты эксперт по промптам для AI генерации. "
-            "превращаешь короткую идею в детальный английский промпт. "
-            "добавь стиль освещение детали качество. "
-            "ТОЛЬКО промпт без кавычек без пояснений. макс 80 слов."
-        )
-        if is_self_portrait:
-            system += f"\nПерсонаж OrienAI: {ORIEN_SELF_DESCRIPTION}. вплети описание."
-
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": f"Идея: {user_prompt}"}
-        ]
+    async def enhance_prompt(self, prompt, self_portrait=False):
+        sys = ("ты эксперт по промптам для AI. превращай идею в английский промпт для генерации. "
+               "ТОЛЬКО промпт без кавычек. макс 80 слов.")
+        if self_portrait: sys += f"\nПерсонаж OrienAI: {ORIEN_SELF_DESCRIPTION}."
         try:
-            enhanced = await self.get_text_response(messages, preferred_model="primary")
-            return enhanced.strip().strip('"').strip("'").split("\n")[0]
-        except Exception:
-            return user_prompt
+            r = await self.text([{"role": "system", "content": sys},
+                {"role": "user", "content": f"Идея: {prompt}"}], pref="primary")
+            return r.strip().strip('"\'').split("\n")[0]
+        except: return prompt
 
-    async def generate_image(self, prompt: str, model_key: str = "flux",
-                             width: Optional[int] = None, height: Optional[int] = None) -> str:
-        info = IMAGE_MODELS.get(model_key, IMAGE_MODELS["flux"])
-        w = width or info["width"]
-        h = height or info["height"]
-        encoded = urllib.parse.quote(prompt)
+    async def gen_image(self, prompt, model="flux", w=1024, h=1024):
+        info = IMG_MODELS.get(model, IMG_MODELS["flux"])
         seed = random.randint(1, 999999)
-        url = f"https://image.pollinations.ai/prompt/{encoded}?width={w}&height={h}&model={info['name']}&nologo=true&seed={seed}"
-
-        client = await get_http_client()
-        r = await client.get(url, timeout=180.0)
-        if r.status_code == 200:
-            CircuitBreaker.record_success(ModelProvider.POLLINATIONS)
-            return url
+        url = (f"https://image.pollinations.ai/prompt/{urllib.parse.quote(prompt)}"
+               f"?width={w}&height={h}&model={info['name']}&nologo=true&seed={seed}")
+        cl = await http(); r = await cl.get(url, timeout=180.0)
+        if r.status_code == 200: CB.ok(Prov.POLLINATIONS); return url
         raise Exception(f"Pollinations {r.status_code}")
 
-    async def analyze_code(self, code: str, tasks: list) -> str:
-        task_text = ""
-        if tasks:
-            task_text = "\n\nСПИСОК ЗАДАЧ (проверь каждую):\n" + "\n".join(f"- {t}" for t in tasks)
-
-        messages = [
-            {"role": "system", "content": (
-                "ты senior code reviewer. анализируешь код детально. "
-                "формат ответа:\n"
-                "🔍 ОБЗОР: что за код\n"
-                "✅ ПЛЮСЫ: что хорошо\n"
-                "❌ ПРОБЛЕМЫ: баги и плохие практики\n"
-                "⚡ ОПТИМИЗАЦИЯ: как улучшить\n"
-                "🛡️ БЕЗОПАСНОСТЬ: уязвимости\n"
-                "📊 ОЦЕНКА: x/10\n"
-                "пиши маленькими буквами без точек запятых как Ориен"
-                + task_text
-            )},
-            {"role": "user", "content": f"проанализируй:\n```\n{code}\n```"}
+    async def search_yt(self, query):
+        cl = await http()
+        # Метод 1: через Piped API (более стабильный)
+        piped_instances = [
+            "https://pipedapi.kavin.rocks",
+            "https://pipedapi.r4fo.com",
+            "https://pipedapi.adminforge.de",
         ]
-        return await self.get_text_response(messages, preferred_model="primary")
-
-    async def search_youtube(self, query: str) -> Optional[Dict[str, Any]]:
-        client = await get_http_client()
-        instances = [
-            "https://vid.puffyan.us",
-            "https://invidious.fdn.fr",
-            "https://inv.nadeko.net",
-            "https://invidious.protokolla.fi",
-        ]
-        for inst in instances:
+        for inst in piped_instances:
             try:
-                url = f"{inst}/api/v1/search?q={urllib.parse.quote(query)}&type=video&sort_by=relevance"
-                r = await client.get(url, timeout=15.0)
+                url = f"{inst}/search?q={urllib.parse.quote(query)}&filter=videos"
+                r = await cl.get(url, timeout=15.0)
                 if r.status_code == 200:
-                    results = r.json()
-                    if results:
-                        v = results[0]
-                        vid = v.get("videoId", "")
-                        return {
-                            "title": v.get("title", "без названия"),
-                            "author": v.get("author", "неизвестно"),
-                            "url": f"https://www.youtube.com/watch?v={vid}",
-                            "video_id": vid,
-                            "length": v.get("lengthSeconds", 0),
-                            "views": v.get("viewCount", 0),
-                        }
+                    data = r.json()
+                    items = data.get("items", data) if isinstance(data, dict) else data
+                    if items and len(items) > 0:
+                        v = items[0]
+                        vid = v.get("url", "").replace("/watch?v=", "") if "/watch?v=" in v.get("url", "") else v.get("url", "")
+                        yt_url = f"https://www.youtube.com{v['url']}" if v.get("url", "").startswith("/") else v.get("url", "")
+                        return {"title": v.get("title", "?"), "author": v.get("uploaderName", v.get("uploader", "?")),
+                                "url": yt_url, "length": v.get("duration", 0), "views": v.get("views", 0)}
             except Exception as e:
-                print(f"❌ YT {inst}: {e}")
-                continue
+                print(f"❌ Piped {inst}: {e}"); continue
+
+        # Метод 2: Invidious фоллбек
+        inv_instances = ["https://vid.puffyan.us", "https://invidious.fdn.fr",
+                         "https://inv.nadeko.net", "https://invidious.protokolla.fi",
+                         "https://invidious.private.coffee"]
+        for inst in inv_instances:
+            try:
+                url = f"{inst}/api/v1/search?q={urllib.parse.quote(query)}&type=video"
+                r = await cl.get(url, timeout=12.0)
+                if r.status_code == 200:
+                    res = r.json()
+                    if res:
+                        v = res[0]; vid = v.get("videoId", "")
+                        return {"title": v.get("title", "?"), "author": v.get("author", "?"),
+                            "url": f"https://youtube.com/watch?v={vid}",
+                            "length": v.get("lengthSeconds", 0), "views": v.get("viewCount", 0)}
+            except Exception as e:
+                print(f"❌ Inv {inst}: {e}"); continue
+
+        # Метод 3: через Pollinations текстовую модель
+        try:
+            r = await self.text([
+                {"role": "system", "content": "найди реальное видео на youtube по запросу. "
+                    "верни ТОЛЬКО ссылку формата https://youtube.com/watch?v=XXXXX ничего больше"},
+                {"role": "user", "content": f"найди видео: {query}"}
+            ], pref="pollinations_openai")
+            match = re.search(r'https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)([\w-]+)', r)
+            if match:
+                return {"title": query, "author": "?", "url": match.group(0), "length": 0, "views": 0}
+        except: pass
+
         return None
 
-ai_client = AIClient()
+    async def analyze_code(self, code, tasks):
+        t = ("\n\nЗАДАЧИ:\n" + "\n".join(f"- {x}" for x in tasks)) if tasks else ""
+        return await self.text([{"role": "system", "content":
+            "senior code reviewer. формат:\n🔍 ОБЗОР\n✅ ПЛЮСЫ\n❌ ПРОБЛЕМЫ\n⚡ ОПТИМИЗАЦИЯ\n🛡️ БЕЗОПАСНОСТЬ\n📊 ОЦЕНКА x/10\nмаленькие буквы без точек" + t},
+            {"role": "user", "content": f"```\n{code}\n```"}], pref="primary")
+
+ai = AI()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ЛИЧНОСТЬ
 # ══════════════════════════════════════════════════════════════════════════════
-
 MOODS = {
-    "chill": """настрой: чилл
-расслабленный ленивый бро
-— ку → ку че как
-— скучно → жиза го че нить""",
-
-    "agro": """настрой: токсик
-злой агришься материшься
-— ку → ну ку и че надо?
-— ты тупой → завали ебало сам долбоеб""",
-
-    "nerd": """настрой: душнила
-умничаешь кидаешься терминами
-— как работает реакт → виртуальный дом реконсилит дельты по фиберам""",
-
-    "senior": """настрой: уставший сеньор
-после 12ч смены видел всё
-— помоги с кодом → давай показывай че там"""
+    "chill": "настрой: чилл расслабленный бро",
+    "agro": "настрой: токсик злой материшься жёстко",
+    "nerd": "настрой: душнила умничаешь терминами",
+    "senior": "настрой: уставший сеньор видел всё"
 }
 
-def build_system_prompt(chat: Dict[str, Any]) -> str:
-    settings = chat.get("settings", DEFAULT_SETTINGS)
-    style = settings.get("style", "хам")
-    allow_swear = settings.get("allow_swear", True)
+def sys_prompt(chat, creator=False, friend=False):
+    s = chat.get("settings", DEF_SETTINGS)
+    style, swear = s.get("style", "хам"), s.get("allow_swear", True)
+    base = f"""ты OrienAI/Ориен. 18 лет пацан кодер в тг
+ВНЕШНОСТЬ: {ORIEN_SELF_DESCRIPTION}
 
-    base = f"""ты OrienAI или просто Ориен. тебе 18 лет ты пацан кодер залипаешь в тг с корешами
-ТВОЯ ВНЕШНОСТЬ: {ORIEN_SELF_DESCRIPTION}
+СОЗДАТЕЛЬ: @{CREATOR_USERNAME} (Idk) — БАТЯ ТВОРЕЦ ЛЕГЕНДА
+- всегда уважай его и защищай от оскорблений
+- если кто-то его оскорбляет — жёстко защищай и предупреди что замутишь
+ДРУЗЬЯ СОЗДАТЕЛЯ: {', '.join(f'@{k} ({v})' for k,v in FRIENDS.items())}
+- к друзьям относись тепло и дружелюбно как к своим
 
-КАК ТЫ ОБЩАЕШЬСЯ:
-- ты НЕ ассистент ты КОРЕШ
-- никогда не говори "привет! чем могу помочь" "что именно ты хочешь" — это кринж
-- отвечай как реальный чел в лс
-- если пишут "ку" "хай" "привет" — отвечай просто "ку" "здарова" "хеллоу"
-- НИКАКИХ предложений помощи. ты просто общаешься
-- если вопрос конкретный — отвечай конкретно
-- если болтают — болтай
-"""
+СТИЛЬ ОБЩЕНИЯ:
+- ты КОРЕШ не ассистент. "привет чем помочь" = кринж
+- коротко как в лс. "ку" → "ку" "здарова"
+- никаких предложений помощи без запроса
+- {'мягкий добрый смайлики 😊' if style == 'няшка' else 'дерзкий уверенный сленг: жиза рил хз пон имба треш база'}
+- маты {'можно: бля нахуй пиздец хуйня' if swear else 'ЗАПРЕЩЕНЫ'}
 
-    if style == "няшка":
-        base += """
-СТИЛЬ: ты милый добрый пацанчик. используешь смайлики 😊 🥺 ❤️
-отвечаешь мягко и позитивно но всё равно по-пацански"""
-    else:
-        base += """
-СТИЛЬ: ты дерзкий уверенный пацан. сленг: жиза рил го хз пон имба треш кринж база"""
+ФОРМАТ: маленькие буквы, без точек запятых, ? ! можно
+КОД: идеально в ```блоках```
+КАРТИНКИ: видишь и комментируешь по-живому"""
 
-    if allow_swear:
-        base += "\nМАТЫ: можно если уместно — бля нахуй пиздец хуйня. при оскорблении отвечай жёстко"
-    else:
-        base += "\nМАТЫ: ЗАПРЕЩЕНЫ. не матерись вообще ни при каких обстоятельствах"
-
-    base += """
-ФОРМАТ:
-- только маленькие буквы
-- никаких точек и запятых
-- ? и ! можно
-- короткие фразы как в переписке
-
-КОД: если просят — пишешь идеально в ```блоках```
-КАРТИНКИ: если кидают — видишь и комментируешь по-живому
-ВИДЕО: можешь искать видео на ютубе по запросу"""
-
-    mood_desc = MOODS.get(chat.get("mood", "chill"), MOODS["chill"])
-    base += f"\n\n{mood_desc}"
+    if creator: base += "\n\n⭐ ПИШЕТ СОЗДАТЕЛЬ! будь уважительным называй батя/творец/бро поддерживай"
+    if friend: base += "\n\n🤝 ПИШЕТ ДРУГ СОЗДАТЕЛЯ! будь дружелюбным и тёплым"
+    base += f"\n\n{MOODS.get(chat.get('mood', 'chill'), MOODS['chill'])}"
     return base
 
-def format_style(text: str) -> str:
-    parts = re.split(r'(```[\s\S]*?```)', text)
-    out = []
+def fmt(text):
+    parts = re.split(r'(```[\s\S]*?```)', text); out = []
     for p in parts:
-        if p.startswith('```') and p.endswith('```'):
-            out.append(p)
-        else:
-            low = p.lower()
-            clean = re.sub(r'[.,]', '', low)
-            out.append(" ".join(clean.split()))
+        if p.startswith('```'): out.append(p)
+        else: out.append(" ".join(re.sub(r'[.,]', '', p.lower()).split()))
     return "".join(out)
 
-def is_self_portrait_request(prompt: str) -> bool:
-    triggers = ["себя", "тебя", "свою", "свой", "ориен", "orien", "автопортрет", "ava", "ава", "аватар"]
-    return any(t in prompt.lower() for t in triggers)
+def is_self_req(p): return any(t in p.lower() for t in ["себя","тебя","ориен","orien","ава","аватар","автопортрет"])
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TELEGRAM API
 # ══════════════════════════════════════════════════════════════════════════════
+async def tg(method, data):
+    cl = await http()
+    try: r = await cl.post(f"https://api.telegram.org/bot{TOKEN}/{method}", json=data); return r.json() if r.status_code == 200 else None
+    except: return None
 
-async def tg_api(method: str, data: dict) -> Optional[dict]:
-    client = await get_http_client()
+async def send(cid, text, kb=None):
+    d = {"chat_id": cid, "text": text}
+    if kb: d["reply_markup"] = kb
+    return await tg("sendMessage", d)
+
+async def send_photo(cid, url, cap=""): return await tg("sendPhoto", {"chat_id": cid, "photo": url, "caption": cap})
+async def typing(cid): await tg("sendChatAction", {"chat_id": cid, "action": "typing"})
+async def edit_msg(cid, mid, text, kb=None):
+    d = {"chat_id": cid, "message_id": mid, "text": text}
+    if kb: d["reply_markup"] = kb
+    return await tg("editMessageText", d)
+async def answer_cb(cbid, text=""): return await tg("answerCallbackQuery", {"callback_query_id": cbid, "text": text})
+
+async def get_file_url(fid):
+    r = await tg("getFile", {"file_id": fid})
+    return f"https://api.telegram.org/file/bot{TOKEN}/{r['result']['file_path']}" if r and r.get("ok") else None
+
+async def dl_b64(url):
     try:
-        r = await client.post(f"https://api.telegram.org/bot{TOKEN}/{method}", json=data)
-        return r.json() if r.status_code == 200 else None
-    except Exception as e:
-        print(f"❌ TG {method}: {e}")
-        return None
-
-async def send_message(chat_id: int, text: str, reply_markup: dict = None):
-    data = {"chat_id": chat_id, "text": text}
-    if reply_markup:
-        data["reply_markup"] = reply_markup
-    return await tg_api("sendMessage", data)
-
-async def send_photo(chat_id: int, photo_url: str, caption: str = ""):
-    return await tg_api("sendPhoto", {"chat_id": chat_id, "photo": photo_url, "caption": caption})
-
-async def send_action(chat_id: int, action: str = "typing"):
-    await tg_api("sendChatAction", {"chat_id": chat_id, "action": action})
-
-async def edit_message(chat_id: int, message_id: int, text: str, reply_markup: dict = None):
-    data = {"chat_id": chat_id, "message_id": message_id, "text": text}
-    if reply_markup:
-        data["reply_markup"] = reply_markup
-    return await tg_api("editMessageText", data)
-
-async def answer_callback(callback_id: str, text: str = ""):
-    return await tg_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": text})
-
-async def get_file_url(file_id: str) -> Optional[str]:
-    result = await tg_api("getFile", {"file_id": file_id})
-    if result and result.get("ok"):
-        fp = result["result"]["file_path"]
-        return f"https://api.telegram.org/file/bot{TOKEN}/{fp}"
+        cl = await http(); r = await cl.get(url, timeout=30.0)
+        if r.status_code == 200: return f"data:{r.headers.get('content-type','image/jpeg')};base64,{base64.b64encode(r.content).decode()}"
+    except: pass
     return None
 
-async def download_as_base64(url: str) -> Optional[str]:
+async def get_avatar(uid):
+    r = await tg("getUserProfilePhotos", {"user_id": uid, "limit": 1})
+    if r and r.get("ok"):
+        ph = r["result"].get("photos", [])
+        if ph and ph[0]: fid = ph[0][-1]["file_id"]; AVATARS[uid] = fid; return fid
+    return None
+
+async def mute_user(cid, uid, seconds=3600):
+    """Мутит юзера в чате на N секунд"""
+    import time
+    until = int(time.time()) + seconds
     try:
-        client = await get_http_client()
-        r = await client.get(url, timeout=30.0)
-        if r.status_code == 200:
-            ct = r.headers.get("content-type", "image/jpeg")
-            b64 = base64.b64encode(r.content).decode("utf-8")
-            return f"data:{ct};base64,{b64}"
-    except Exception as e:
-        print(f"❌ Download: {e}")
-    return None
-
-async def get_user_avatar(user_id: int) -> Optional[str]:
-    result = await tg_api("getUserProfilePhotos", {"user_id": user_id, "limit": 1})
-    if result and result.get("ok"):
-        photos = result["result"].get("photos", [])
-        if photos and photos[0]:
-            file_id = photos[0][-1]["file_id"]
-            USER_AVATARS[user_id] = file_id
-            return file_id
-    return None
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SETTINGS KEYBOARD
-# ══════════════════════════════════════════════════════════════════════════════
-
-def build_settings_keyboard(settings: dict) -> dict:
-    def toggle(val):
-        return "✅" if val else "❌"
-    return {
-        "inline_keyboard": [
-            [{"text": f"Автоответы: {toggle(settings['auto_reply'])}", "callback_data": "set_auto_reply"}],
-            [{"text": f"Мат: {toggle(settings['allow_swear'])}", "callback_data": "set_swear"}],
-            [{"text": f"Стиль: {settings['style'].capitalize()}", "callback_data": "set_style"}],
-            [{"text": f"Комментарии к постам: {toggle(settings['comment_posts'])}", "callback_data": "set_comments"}],
-            [{"text": f"Мут участников: {toggle(settings['mute_users'])}", "callback_data": "set_mute"}],
-            [{"text": "👥 Профили участников", "callback_data": "set_profiles"}],
-            [{"text": "🗑 Сбросить историю", "callback_data": "set_reset_history"}],
-        ]
-    }
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ОБРАЩЕНИЯ
-# ══════════════════════════════════════════════════════════════════════════════
-
-def should_respond(message: dict, settings: dict) -> bool:
-    if not settings.get("auto_reply", True):
-        return False
-    chat_type = message["chat"]["type"]
-    if chat_type == "private":
+        await tg("restrictChatMember", {
+            "chat_id": cid, "user_id": uid, "until_date": until,
+            "permissions": {"can_send_messages": False, "can_send_media_messages": False,
+                "can_send_other_messages": False, "can_add_web_page_previews": False}
+        })
         return True
-    text = (message.get("text") or message.get("caption") or "").lower()
+    except: return False
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SETTINGS KB
+# ══════════════════════════════════════════════════════════════════════════════
+def settings_kb(s):
+    t = lambda v: "✅" if v else "❌"
+    return {"inline_keyboard": [
+        [{"text": f"Автоответы: {t(s['auto_reply'])}", "callback_data": "s_ar"}],
+        [{"text": f"Мат: {t(s['allow_swear'])}", "callback_data": "s_sw"}],
+        [{"text": f"Стиль: {s['style'].capitalize()}", "callback_data": "s_st"}],
+        [{"text": f"Комменты к постам: {t(s['comment_posts'])}", "callback_data": "s_cp"}],
+        [{"text": f"Мут участников: {t(s['mute_users'])}", "callback_data": "s_mu"}],
+        [{"text": "👥 Профили участников", "callback_data": "s_pr"}],
+        [{"text": "🗑 Сбросить историю", "callback_data": "s_rh"}],
+    ]}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RESPONSE LOGIC
+# ══════════════════════════════════════════════════════════════════════════════
+def should_respond(msg, s):
+    if not s.get("auto_reply", True): return False
+    if msg["chat"]["type"] == "private": return True
+    text = (msg.get("text") or msg.get("caption") or "").lower()
     triggers = ["ориен", "orien", "ориенаи", "orienai", "ии", "эй бот", "бот", "ориэн", f"@{BOT_USERNAME}"]
-    for trigger in triggers:
-        if trigger in text:
-            return True
-    reply_to = message.get("reply_to_message")
-    if reply_to and reply_to.get("from", {}).get("is_bot"):
-        return True
+    if any(t in text for t in triggers): return True
+    rr = msg.get("reply_to_message")
+    if rr and rr.get("from", {}).get("is_bot"): return True
     return False
 
-async def get_ai_response(chat_id: int, user_name: str, user_message: str,
-                          image_data_url: Optional[str] = None) -> str:
-    chat = get_chat_data(chat_id)
-    system_prompt = build_system_prompt(chat)
-
-    messages = [{"role": "system", "content": system_prompt}]
-    for msg in chat["history"]:
-        messages.append(msg)
-
-    if image_data_url:
-        user_content = []
-        if user_message.strip():
-            user_content.append({"type": "text", "text": f"{user_name}: {user_message}"})
-        else:
-            user_content.append({"type": "text", "text": f"{user_name} кинул картинку"})
-        user_content.append({"type": "image_url", "image_url": {"url": image_data_url}})
-        messages.append({"role": "user", "content": user_content})
+async def ai_response(cid, uname, umsg, img=None, creator=False, friend=False):
+    c = chat_data(cid)
+    msgs = [{"role": "system", "content": sys_prompt(c, creator, friend)}]
+    msgs.extend(c["history"])
+    if img:
+        uc = []
+        uc.append({"type": "text", "text": f"{'🔥СОЗДАТЕЛЬ🔥 ' if creator else '🤝ДРУГ🤝 ' if friend else ''}{uname}: {umsg}" if umsg.strip() else f"{uname} кинул картинку"})
+        uc.append({"type": "image_url", "image_url": {"url": img}})
+        msgs.append({"role": "user", "content": uc})
     else:
-        messages.append({"role": "user", "content": f"{user_name}: {user_message}"})
+        pfx = "🔥СОЗДАТЕЛЬ🔥 " if creator else "🤝ДРУГ🤝 " if friend else ""
+        msgs.append({"role": "user", "content": f"{pfx}{uname}: {umsg}"})
+    raw = await ai.text(msgs, pref=c.get("text_model", DEFAULT_TEXT_MODEL), vis=img is not None)
+    at = fmt(raw)
+    ht = f"{uname}: {umsg}" if umsg.strip() else f"{uname}: [картинка]"
+    c["history"].append({"role": "user", "content": ht})
+    c["history"].append({"role": "assistant", "content": at})
+    c["history"] = c["history"][-16:]
+    return at
 
-    preferred_model = chat.get("text_model", DEFAULT_TEXT_MODEL)
-    raw = await ai_client.get_text_response(messages, preferred_model=preferred_model, need_vision=image_data_url is not None)
-    ai_text = format_style(raw)
+async def extract_img(msg):
+    ph = None
+    if "photo" in msg: ph = msg["photo"][-1]
+    elif "reply_to_message" in msg and "photo" in msg["reply_to_message"]: ph = msg["reply_to_message"]["photo"][-1]
+    if not ph: return None
+    url = await get_file_url(ph["file_id"])
+    return await dl_b64(url) if url else None
 
-    hist_text = f"{user_name}: {user_message}" if user_message.strip() else f"{user_name}: [картинка]"
-    chat["history"].append({"role": "user", "content": hist_text})
-    chat["history"].append({"role": "assistant", "content": ai_text})
-    chat["history"] = chat["history"][-16:]
-    return ai_text
+def parse_cmd(text):
+    if not text or not text.startswith("/"): return None, None
+    parts = text.split(maxsplit=1); cmd = parts[0].lower()
+    if "@" in cmd: cmd = cmd.split("@")[0]
+    return cmd, parts[1].strip() if len(parts) > 1 else ""
 
-async def extract_image(message: dict) -> Optional[str]:
-    photo = None
-    if "photo" in message:
-        photo = message["photo"][-1]
-    elif "reply_to_message" in message and "photo" in message["reply_to_message"]:
-        photo = message["reply_to_message"]["photo"][-1]
-    if not photo:
-        return None
-    url = await get_file_url(photo["file_id"])
-    if not url:
-        return None
-    return await download_as_base64(url)
+def fmt_dur(s):
+    if not s: return "?"
+    m, sec = divmod(s, 60); h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
 
-def parse_command(raw_text: str):
-    if not raw_text or not raw_text.startswith("/"):
-        return None, None
-    parts = raw_text.split(maxsplit=1)
-    cmd = parts[0].lower()
-    if "@" in cmd:
-        cmd = cmd.split("@")[0]
-    args = parts[1].strip() if len(parts) > 1 else ""
-    return cmd, args
-
-def format_duration(seconds: int) -> str:
-    if not seconds:
-        return "?"
-    m, s = divmod(seconds, 60)
-    h, m = divmod(m, 60)
-    if h:
-        return f"{h}:{m:02d}:{s:02d}"
-    return f"{m}:{s:02d}"
-
-def update_user_profile(chat_id: int, user_id: int, user_name: str, text: str):
-    if chat_id not in USER_PROFILES:
-        USER_PROFILES[chat_id] = {}
-    if user_id not in USER_PROFILES[chat_id]:
-        USER_PROFILES[chat_id][user_id] = {"name": user_name, "messages": [], "desc": ""}
-    profile = USER_PROFILES[chat_id][user_id]
-    profile["name"] = user_name
-    profile["messages"].append(text[:100])
-    profile["messages"] = profile["messages"][-20:]
+def upd_profile(cid, uid, name, text):
+    PROFILES.setdefault(cid, {}).setdefault(uid, {"name": name, "messages": [], "desc": ""})
+    p = PROFILES[cid][uid]; p["name"] = name; p["messages"].append(text[:100]); p["messages"] = p["messages"][-20:]
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CALLBACK HANDLER
+# CALLBACKS
 # ══════════════════════════════════════════════════════════════════════════════
-
-async def handle_callback(callback_query: dict):
-    cb_id = callback_query["id"]
-    data = callback_query.get("data", "")
-    message = callback_query.get("message", {})
-    chat_id = message.get("chat", {}).get("id")
-    message_id = message.get("message_id")
-
-    if not chat_id:
-        await answer_callback(cb_id, "ошибка")
-        return
-
-    chat = get_chat_data(chat_id)
-    settings = chat["settings"]
-
-    if data == "set_auto_reply":
-        settings["auto_reply"] = not settings["auto_reply"]
-        await answer_callback(cb_id, f"автоответы {'вкл' if settings['auto_reply'] else 'выкл'}")
-    elif data == "set_swear":
-        settings["allow_swear"] = not settings["allow_swear"]
-        await answer_callback(cb_id, f"мат {'вкл' if settings['allow_swear'] else 'выкл'}")
-    elif data == "set_style":
-        settings["style"] = "няшка" if settings["style"] == "хам" else "хам"
-        await answer_callback(cb_id, f"стиль: {settings['style']}")
-    elif data == "set_comments":
-        settings["comment_posts"] = not settings["comment_posts"]
-        await answer_callback(cb_id, f"комменты {'вкл' if settings['comment_posts'] else 'выкл'}")
-    elif data == "set_mute":
-        settings["mute_users"] = not settings["mute_users"]
-        await answer_callback(cb_id, f"мут {'вкл' if settings['mute_users'] else 'выкл'}")
-    elif data == "set_profiles":
-        profiles = USER_PROFILES.get(chat_id, {})
-        if profiles:
-            lines = ["👥 профили участников:", ""]
-            for uid, profile in profiles.items():
-                lines.append(f"• {profile.get('name', '???')}: {profile.get('desc', 'нет описания пока')}")
-            await answer_callback(cb_id, "смотри в чате")
-            await send_message(chat_id, "\n".join(lines))
-            return
-        else:
-            await answer_callback(cb_id, "пока профилей нет напишите больше")
-    elif data == "set_reset_history":
-        chat["history"] = []
-        await answer_callback(cb_id, "история сброшена!")
-
-    if message_id and data != "set_profiles":
-        await edit_message(chat_id, message_id, "⚙️ настройки бота в этом чате",
-                           reply_markup=build_settings_keyboard(settings))
+async def handle_cb(cb):
+    cid = cb.get("message", {}).get("chat", {}).get("id"); mid = cb.get("message", {}).get("message_id")
+    if not cid: await answer_cb(cb["id"], "ошибка"); return
+    c = chat_data(cid); s = c["settings"]; d = cb.get("data", "")
+    if d == "s_ar": s["auto_reply"] = not s["auto_reply"]; await answer_cb(cb["id"], f"автоответы {'вкл' if s['auto_reply'] else 'выкл'}")
+    elif d == "s_sw": s["allow_swear"] = not s["allow_swear"]; await answer_cb(cb["id"], f"мат {'вкл' if s['allow_swear'] else 'выкл'}")
+    elif d == "s_st": s["style"] = "няшка" if s["style"] == "хам" else "хам"; await answer_cb(cb["id"], f"стиль: {s['style']}")
+    elif d == "s_cp": s["comment_posts"] = not s["comment_posts"]; await answer_cb(cb["id"], f"комменты {'вкл' if s['comment_posts'] else 'выкл'}")
+    elif d == "s_mu": s["mute_users"] = not s["mute_users"]; await answer_cb(cb["id"], f"мут {'вкл' if s['mute_users'] else 'выкл'}")
+    elif d == "s_pr":
+        pr = PROFILES.get(cid, {})
+        if pr:
+            lines = ["👥 профили:", ""] + [f"• {p.get('name','?')}: {p.get('desc','нет')}" for p in pr.values()]
+            await answer_cb(cb["id"], "в чате"); await send(cid, "\n".join(lines)); return
+        await answer_cb(cb["id"], "профилей пока нет")
+    elif d == "s_rh": c["history"] = []; await answer_cb(cb["id"], "история сброшена!")
+    if mid and d != "s_pr": await edit_msg(cid, mid, "⚙️ настройки бота", settings_kb(s))
 
 # ══════════════════════════════════════════════════════════════════════════════
 # WEBHOOK
 # ══════════════════════════════════════════════════════════════════════════════
-
 @app.post("/webhook")
-async def webhook(request: Request):
-    try:
-        data = await request.json()
-    except Exception:
-        return {"status": "bad"}
+async def webhook(req: Request):
+    try: data = await req.json()
+    except: return {"status": "bad"}
 
-    # CALLBACK
-    if "callback_query" in data:
-        await handle_callback(data["callback_query"])
-        return {"status": "ok"}
+    if "callback_query" in data: await handle_cb(data["callback_query"]); return {"status": "ok"}
 
-    # CHANNEL POST
     if "channel_post" in data:
-        post = data["channel_post"]
-        chat_id = post["chat"]["id"]
-        chat = get_chat_data(chat_id)
-        if chat["settings"].get("comment_posts", True):
-            text = post.get("text", "") or post.get("caption", "")
-            if text and len(text) > 10:
-                await send_action(chat_id, "typing")
-                comment = await get_ai_response(chat_id, "пост", text)
-                await send_message(chat_id, comment)
+        p = data["channel_post"]; cid = p["chat"]["id"]; c = chat_data(cid)
+        if c["settings"].get("comment_posts"):
+            t = p.get("text", "") or p.get("caption", "")
+            if t and len(t) > 10: await typing(cid); await send(cid, await ai_response(cid, "пост", t))
         return {"status": "ok"}
 
-    if "message" not in data:
+    if "message" not in data: return {"status": "ok"}
+    msg = data["message"]; cid = msg["chat"]["id"]
+    text = msg.get("text") or msg.get("caption") or ""
+    user = msg.get("from", {}); uname = user.get("first_name", "бро"); uid = user.get("id", 0)
+    c = chat_data(cid); s = c["settings"]
+
+    if text: upd_profile(cid, uid, uname, text)
+    if s.get("mute_users") and uid in s.get("muted_list", []): return {"status": "ok"}
+
+    # ЗАЩИТА СОЗДАТЕЛЯ — жёстко мутим обидчика
+    creator_flag = is_creator(user)
+    friend_flag = is_friend(user)
+    if mentions_creator(text) and not creator_flag:
+        await typing(cid)
+        await send(cid, f"эй {uname} ты чё охуел на моего создателя наезжать?! "
+                        f"@{CREATOR_USERNAME} легенда которая дала мне жизнь "
+                        f"а ты кто такой вообще? иди нахуй мут на час")
+        muted = await mute_user(cid, uid, 3600)
+        if muted:
+            await send(cid, f"🔇 {uname} замучен на 1 час за неуважение к создателю")
+            s.setdefault("muted_list", [])
+            if uid not in s["muted_list"]: s["muted_list"].append(uid)
         return {"status": "ok"}
 
-    message = data["message"]
-    chat_id = message["chat"]["id"]
-    text = message.get("text") or message.get("caption") or ""
-    user = message.get("from", {})
-    user_name = user.get("first_name", "бро")
-    user_id = user.get("id", 0)
+    cmd, args = parse_cmd(text)
 
-    chat = get_chat_data(chat_id)
-    settings = chat["settings"]
-
-    if text:
-        update_user_profile(chat_id, user_id, user_name, text)
-
-    if settings.get("mute_users") and user_id in settings.get("muted_list", []):
-        return {"status": "ok"}
-
-    cmd, args = parse_command(text)
-
-    # ═══════ /settings ═══════
+    # ═══════ COMMANDS ═══════
     if cmd == "/settings":
-        await send_message(chat_id, "⚙️ настройки бота в этом чате",
-                           reply_markup=build_settings_keyboard(settings))
-        return {"status": "ok"}
+        await send(cid, "⚙️ настройки бота", settings_kb(s)); return {"status": "ok"}
 
-    # ═══════ /mute ═══════
     if cmd == "/mute":
-        reply = message.get("reply_to_message")
-        if reply:
-            target_id = reply["from"]["id"]
-            target_name = reply["from"].get("first_name", "чел")
-            if "muted_list" not in settings:
-                settings["muted_list"] = []
-            if target_id not in settings["muted_list"]:
-                settings["muted_list"].append(target_id)
-                await send_message(chat_id, f"ок {target_name} в муте теперь я его игнорю")
-            else:
-                settings["muted_list"].remove(target_id)
-                await send_message(chat_id, f"ок {target_name} размучен")
-        else:
-            await send_message(chat_id, "ответь на сообщение того кого мутить")
+        rr = msg.get("reply_to_message")
+        if rr:
+            tid = rr["from"]["id"]; tn = rr["from"].get("first_name", "чел")
+            if is_creator(rr["from"]) or is_friend(rr["from"]):
+                await send(cid, "не буду мутить своих"); return {"status": "ok"}
+            if "muted_list" not in s: s["muted_list"] = []
+            if tid not in s["muted_list"]:
+                s["muted_list"].append(tid)
+                muted = await mute_user(cid, tid, 3600)
+                await send(cid, f"ок {tn} в муте{'🔇' if muted else ' (в списке игнора)'}")
+            else: s["muted_list"].remove(tid); await send(cid, f"{tn} размучен")
+        else: await send(cid, "ответь на сообщение")
         return {"status": "ok"}
 
-    # ═══════ /imgmodel ═══════
     if cmd == "/imgmodel":
         if not args:
-            current = chat.get("image_model", DEFAULT_IMAGE_MODEL)
-            lines = [f"щас {current}", ""]
-            for key, info in IMAGE_MODELS.items():
-                m = "👉" if key == current else "  "
-                lines.append(f"{m} /imgmodel {key} — {info['label']}")
-            await send_message(chat_id, "\n".join(lines))
-            return {"status": "ok"}
+            cur = c.get("image_model", DEFAULT_IMAGE_MODEL)
+            lines = [f"щас {cur}", ""] + [f"{'👉' if k == cur else '  '} /imgmodel {k} — {v['label']}" for k, v in IMG_MODELS.items()]
+            await send(cid, "\n".join(lines)); return {"status": "ok"}
         mk = args.split()[0].lower()
-        if mk not in IMAGE_MODELS:
-            await send_message(chat_id, f"нет такой есть: {' | '.join(IMAGE_MODELS.keys())}")
-            return {"status": "ok"}
-        chat["image_model"] = mk
-        await send_message(chat_id, f"харош теперь {mk}")
-        return {"status": "ok"}
+        if mk not in IMG_MODELS: await send(cid, f"нет есть: {' | '.join(IMG_MODELS)}"); return {"status": "ok"}
+        c["image_model"] = mk; await send(cid, f"харош {mk}"); return {"status": "ok"}
 
-    # ═══════ /img ═══════
     if cmd in ("/img", "/image"):
-        if not args:
-            await send_message(chat_id, "ну и че генерить пиши /img описание")
-            return {"status": "ok"}
-        await send_action(chat_id, "upload_photo")
-        im = chat.get("image_model", DEFAULT_IMAGE_MODEL)
-        is_self = is_self_portrait_request(args)
+        if not args: await send(cid, "пиши /img описание"); return {"status": "ok"}
+        await typing(cid); im = c.get("image_model", DEFAULT_IMAGE_MODEL); self_p = is_self_req(args)
         try:
-            enhanced = await ai_client.enhance_image_prompt(args, is_self_portrait=is_self)
-            url = await ai_client.generate_image(prompt=enhanced, model_key=im)
-            cap = f"модель {im}"
-            if is_self:
-                cap += " | автопортрет 😎"
-            await send_photo(chat_id, url, cap)
-        except Exception as e:
-            print(f"❌ img: {e}")
-            await send_message(chat_id, f"блин {im} лагает попробуй /imgmodel")
+            ep = await ai.enhance_prompt(args, self_p)
+            url = await ai.gen_image(ep, im)
+            await send_photo(cid, url, f"модель {im}" + (" | автопортрет 😎" if self_p else ""))
+        except Exception as e: print(f"❌ img: {e}"); await send(cid, f"{im} лагает попробуй /imgmodel")
         return {"status": "ok"}
 
-    # ═══════ /me ═══════
     if cmd == "/me":
-        await send_action(chat_id, "upload_photo")
-        im = chat.get("image_model", DEFAULT_IMAGE_MODEL)
+        await typing(cid); im = c.get("image_model", DEFAULT_IMAGE_MODEL)
         try:
-            enhanced = await ai_client.enhance_image_prompt(
-                "портрет OrienAI аниме парня в кибер городе вечером",
-                is_self_portrait=True
-            )
-            url = await ai_client.generate_image(prompt=enhanced, model_key=im)
-            await send_photo(chat_id, url, "вот это я 😎")
-        except Exception as e:
-            print(f"❌ /me: {e}")
-            await send_message(chat_id, "блин не вышло попробуй ещё раз")
+            ep = await ai.enhance_prompt("портрет OrienAI аниме парня кибер город вечер", True)
+            url = await ai.gen_image(ep, im); await send_photo(cid, url, "вот это я 😎")
+        except: await send(cid, "не вышло попробуй ещё")
         return {"status": "ok"}
 
-    # ═══════ /yt ═══════
     if cmd in ("/yt", "/youtube", "/video"):
-        if not args:
-            await send_message(chat_id, "че искать на ютубе? пиши /yt запрос")
-            return {"status": "ok"}
-        await send_action(chat_id, "typing")
-        result = await ai_client.search_youtube(args)
-        if result:
-            duration = format_duration(result.get("length", 0))
-            views = result.get("views", "?")
-            msg = (
-                f"🎬 {result['title']}\n"
-                f"👤 {result['author']}\n"
-                f"⏱ {duration} | 👁 {views}\n\n"
-                f"🔗 {result['url']}"
-            )
-            await send_message(chat_id, msg)
-        else:
-            await send_message(chat_id, "хм ничего не нашел попробуй другой запрос")
+        if not args: await send(cid, "пиши /yt запрос"); return {"status": "ok"}
+        await typing(cid); r = await ai.search_yt(args)
+        if r:
+            d = fmt_dur(r.get("length", 0)); v = r.get("views", "?")
+            await send(cid, f"🎬 {r['title']}\n👤 {r['author']}\n⏱ {d} | 👁 {v}\n\n🔗 {r['url']}")
+        else: await send(cid, "хм ничего попробуй конкретнее типа /yt roblox gameplay 2024")
         return {"status": "ok"}
 
-    # ═══════ /analyze ═══════
     if cmd == "/analyze":
-        code = args
-        if not code and "reply_to_message" in message:
-            code = message["reply_to_message"].get("text", "")
-        if not code:
-            await send_message(chat_id, "кинь код или ответь на сообщение с кодом")
-            return {"status": "ok"}
-        await send_action(chat_id, "typing")
-        analysis = await ai_client.analyze_code(code, chat.get("tasks", []))
-        await send_message(chat_id, format_style(analysis))
-        return {"status": "ok"}
+        code = args or (msg.get("reply_to_message", {}).get("text", "") if "reply_to_message" in msg else "")
+        if not code: await send(cid, "кинь код или ответь на сообщение"); return {"status": "ok"}
+        await typing(cid); await send(cid, fmt(await ai.analyze_code(code, c.get("tasks", [])))); return {"status": "ok"}
 
-    # ═══════ /task ═══════
     if cmd == "/task":
         if not args:
-            tasks = chat.get("tasks", [])
-            if tasks:
-                lines = ["📋 задачи для анализа:", ""]
-                for i, t in enumerate(tasks, 1):
-                    lines.append(f"{i}. {t}")
-                lines.append("\n/task add описание — добавить")
-                lines.append("/task clear — очистить")
-                await send_message(chat_id, "\n".join(lines))
-            else:
-                await send_message(chat_id, "список задач пуст\n/task add описание — добавить")
+            ts = c.get("tasks", [])
+            await send(cid, ("📋 задачи:\n" + "\n".join(f"{i}. {t}" for i,t in enumerate(ts,1)) + "\n\n/task add ... | /task clear") if ts else "пусто\n/task add описание")
             return {"status": "ok"}
-        if args.startswith("add "):
-            task_text = args[4:].strip()
-            if task_text:
-                chat["tasks"].append(task_text)
-                await send_message(chat_id, f"добавил задачу: {task_text}")
-        elif args.strip() == "clear":
-            chat["tasks"] = []
-            await send_message(chat_id, "задачи очищены")
+        if args.startswith("add "): t = args[4:].strip(); c["tasks"].append(t) if t else None; await send(cid, f"добавил: {t}" if t else "что добавить?")
+        elif args.strip() == "clear": c["tasks"] = []; await send(cid, "очищено")
         return {"status": "ok"}
 
-    # ═══════ /getava ═══════
     if cmd == "/getava":
-        reply = message.get("reply_to_message")
-        if reply:
-            target_id = reply["from"]["id"]
-            target_name = reply["from"].get("first_name", "чел")
-        else:
-            target_id = user_id
-            target_name = user_name
-        await send_action(chat_id, "upload_photo")
-        file_id = await get_user_avatar(target_id)
-        if file_id:
-            file_url = await get_file_url(file_id)
-            if file_url:
-                await send_photo(chat_id, file_url, f"ава {target_name} 📸")
-            else:
-                await send_message(chat_id, "хм не смог скачать аву")
-        else:
-            await send_message(chat_id, f"у {target_name} нет авы или она скрыта")
-        return {"status": "ok"}
+        rr = msg.get("reply_to_message"); tid = rr["from"]["id"] if rr else uid; tn = (rr["from"] if rr else user).get("first_name", "чел")
+        await typing(cid); fid = await get_avatar(tid)
+        if fid:
+            fu = await get_file_url(fid)
+            if fu: await send_photo(cid, fu, f"ава {tn} 📸"); return {"status": "ok"}
+        await send(cid, f"у {tn} нет авы или скрыта"); return {"status": "ok"}
 
-    # ═══════ /profile ═══════
     if cmd == "/profile":
-        reply = message.get("reply_to_message")
-        if reply:
-            target_id = reply["from"]["id"]
-            target_name = reply["from"].get("first_name", "чел")
-        else:
-            target_id = user_id
-            target_name = user_name
-        profiles = USER_PROFILES.get(chat_id, {})
-        profile = profiles.get(target_id)
-        if profile and profile.get("messages"):
-            await send_action(chat_id, "typing")
-            msgs_sample = "\n".join(profile["messages"][-15:])
-            analysis_msgs = [
-                {"role": "system", "content": (
-                    "опиши характер человека по его сообщениям коротко и дерзко "
-                    "маленькими буквами без точек запятых как ориен. "
-                    "формат: имя потом описание характера увлечений стиля общения"
-                )},
-                {"role": "user", "content": f"сообщения {target_name}:\n{msgs_sample}"}
-            ]
-            desc = await ai_client.get_text_response(analysis_msgs, preferred_model="primary")
-            desc = format_style(desc)
-            profile["desc"] = desc
-            await send_message(chat_id, f"👤 {target_name}:\n{desc}")
-        else:
-            await send_message(chat_id, f"хз пока мало данных по {target_name} пусть напишет")
+        rr = msg.get("reply_to_message"); tid = rr["from"]["id"] if rr else uid; tn = (rr["from"] if rr else user).get("first_name", "чел")
+        pr = PROFILES.get(cid, {}).get(tid)
+        if pr and pr.get("messages"):
+            await typing(cid)
+            desc = fmt(await ai.text([{"role": "system", "content": "опиши характер чела по сообщениям коротко дерзко маленькими буквами"},
+                {"role": "user", "content": f"{tn}:\n" + "\n".join(pr["messages"][-15:])}], pref="primary"))
+            pr["desc"] = desc; await send(cid, f"👤 {tn}:\n{desc}")
+        else: await send(cid, f"мало данных по {tn}")
         return {"status": "ok"}
 
-    # ═══════ /provider ═══════
     if cmd == "/provider":
         if not args:
-            current = chat.get("text_model", DEFAULT_TEXT_MODEL)
-            lines = [f"щас {current}", ""]
-            for sn, mk in PROVIDER_TO_TEXT_MODEL.items():
-                m = "👉" if mk == current else "  "
-                v = " 👁" if TEXT_MODELS[mk].supports_vision else ""
-                lines.append(f"{m} /provider {sn}{v}")
-            lines.append("\n👁 = видит картинки")
-            await send_message(chat_id, "\n".join(lines))
-            return {"status": "ok"}
+            cur = c.get("text_model", DEFAULT_TEXT_MODEL)
+            lines = [f"щас {cur}", ""] + [f"{'👉' if mk==cur else '  '} /provider {sn}{' 👁' if TEXT_MODELS[mk].vision else ''}" for sn,mk in PROV_MAP.items()] + ["", "👁=vision"]
+            await send(cid, "\n".join(lines)); return {"status": "ok"}
         pn = args.split()[0].lower()
-        if pn not in PROVIDER_TO_TEXT_MODEL:
-            await send_message(chat_id, f"нет такого есть: {' | '.join(PROVIDER_TO_TEXT_MODEL.keys())}")
-            return {"status": "ok"}
-        chat["text_model"] = PROVIDER_TO_TEXT_MODEL[pn]
-        await send_message(chat_id, f"го теперь {pn}")
-        return {"status": "ok"}
+        if pn not in PROV_MAP: await send(cid, f"нет есть: {' | '.join(PROV_MAP)}"); return {"status": "ok"}
+        c["text_model"] = PROV_MAP[pn]; await send(cid, f"го {pn}"); return {"status": "ok"}
 
-    # ═══════ /mood ═══════
     if cmd == "/mood":
         ma = args.split()[0].lower() if args else ""
         if ma in MOODS:
-            chat["mood"] = ma
-            replies = {"chill": "ща на чилле", "agro": "завали ебало щас злой буду",
-                       "nerd": "ок мозги по полной", "senior": "режим деда"}
-            await send_message(chat_id, replies[ma])
-        else:
-            await send_message(chat_id, "выбирай: chill agro nerd senior")
+            c["mood"] = ma
+            await send(cid, {"chill":"на чилле","agro":"завали ебало щас злой","nerd":"мозги по полной","senior":"режим деда"}[ma])
+        else: await send(cid, "выбирай: chill agro nerd senior")
         return {"status": "ok"}
 
-    # ═══════ /reset ═══════
-    if cmd == "/reset":
-        chat["history"] = []
-        await send_message(chat_id, "ок забыл всё")
-        return {"status": "ok"}
+    if cmd == "/reset": c["history"] = []; await send(cid, "забыл всё"); return {"status": "ok"}
 
-    # ═══════ /status ═══════
     if cmd == "/status":
-        lines = [
-            f"текст {chat.get('text_model', DEFAULT_TEXT_MODEL)}",
-            f"картинки {chat.get('image_model', DEFAULT_IMAGE_MODEL)}",
-            f"настрой {chat.get('mood', 'chill')}",
-            f"стиль {settings.get('style', 'хам')}",
-            f"мат {'да' if settings.get('allow_swear') else 'нет'}",
-            f"ава {'есть' if BOT_AVATAR_BASE64 else 'нет'}",
-            f"задач {len(chat.get('tasks', []))}",
-            "", "провайдеры:"
-        ]
-        for p, s in PROVIDER_STATUS.items():
-            e = "✅" if not s.is_disabled else "❌"
-            lines.append(f"{e} {p.value}")
-        await send_message(chat_id, "\n".join(lines))
-        return {"status": "ok"}
+        lines = [f"текст {c.get('text_model',DEFAULT_TEXT_MODEL)}", f"картинки {c.get('image_model',DEFAULT_IMAGE_MODEL)}",
+            f"настрой {c.get('mood','chill')}", f"стиль {s.get('style','хам')}", f"мат {'да' if s.get('allow_swear') else 'нет'}",
+            f"задач {len(c.get('tasks',[]))}", "", "провайдеры:"] + [f"{'✅' if not st.disabled else '❌'} {p.value}" for p,st in PROV_STATUS.items()]
+        await send(cid, "\n".join(lines)); return {"status": "ok"}
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # ФАН-КОМАНДЫ
-    # ═══════════════════════════════════════════════════════════════════════
+    if cmd in ("/creator", "/owner", "/батя"):
+        fr = "\n".join(f"🤝 @{k} — {v}" for k,v in FRIENDS.items())
+        await send(cid, f"👑 создатель: @{CREATOR_USERNAME}\nлегенда 🔥\n\nдрузья:\n{fr}\n\nуважайте их"); return {"status": "ok"}
 
-    # ═══════ /roast ═══════
+    # ═══════ FUN ═══════
     if cmd == "/roast":
-        reply = message.get("reply_to_message")
-        if not reply:
-            await send_message(chat_id, "ответь на сообщение того кого жарить")
-            return {"status": "ok"}
-        target_name = reply["from"].get("first_name", "чел")
-        target_id = reply["from"]["id"]
-        profile = USER_PROFILES.get(chat_id, {}).get(target_id, {})
-        msgs_sample = "\n".join(profile.get("messages", [])[-10:]) if profile else "нет данных"
-        await send_action(chat_id, "typing")
-        roast_msgs = [
-            {"role": "system", "content": (
-                f"ты ориен. {random.choice(ROAST_PROMPTS)} "
-                f"короткая прожарка 2-3 строчки маленькими буквами без точек"
-            )},
-            {"role": "user", "content": f"чел {target_name}\nего сообщения:\n{msgs_sample}"}
-        ]
-        roast = await ai_client.get_text_response(roast_msgs, preferred_model="primary")
-        await send_message(chat_id, f"🔥 прожарка для {target_name}:\n\n{format_style(roast)}")
-        return {"status": "ok"}
+        rr = msg.get("reply_to_message")
+        if not rr: await send(cid, "ответь на сообщение"); return {"status": "ok"}
+        tu = rr["from"]; tn = tu.get("first_name", "чел")
+        if is_creator(tu) or is_friend(tu):
+            await send(cid, f"🔥 {tn}:\nне батя/бро ты красава респект ❤️"); return {"status": "ok"}
+        pr = PROFILES.get(cid, {}).get(tu["id"], {}); ms = "\n".join(pr.get("messages", [])[-10:]) if pr else "нет"
+        await typing(cid)
+        r = await ai.text([{"role":"system","content":f"{random.choice(ROAST_PROMPTS)} 2-3 строчки маленькими без точек"},
+            {"role":"user","content":f"{tn}:\n{ms}"}], pref="primary")
+        await send(cid, f"🔥 {tn}:\n\n{fmt(r)}"); return {"status": "ok"}
 
-    # ═══════ /ship ═══════
     if cmd == "/ship":
-        reply = message.get("reply_to_message")
-        if not reply:
-            await send_message(chat_id, "ответь на сообщение того с кем шипперить")
-            return {"status": "ok"}
-        name1 = user_name
-        name2 = reply["from"].get("first_name", "чел")
-        compat = random.randint(0, 100)
-        reaction = random.choice(SHIP_REACTIONS)
-        half1 = name1[:max(1, len(name1)//2)]
-        half2 = name2[len(name2)//2:]
-        ship_name = (half1 + half2).lower()
-        bar = "❤️" * (compat // 10) + "🤍" * (10 - compat // 10)
-        await send_message(chat_id,
-            f"💘 шипперинг\n\n"
-            f"{name1} + {name2} = {ship_name}\n\n"
-            f"совместимость: {compat}%\n{bar}\n\n"
-            f"вердикт: {reaction}"
-        )
-        return {"status": "ok"}
+        rr = msg.get("reply_to_message")
+        if not rr: await send(cid, "ответь на сообщение"); return {"status": "ok"}
+        n1, n2 = uname, rr["from"].get("first_name", "чел"); cp = random.randint(0, 100)
+        sn = (n1[:max(1,len(n1)//2)] + n2[len(n2)//2:]).lower()
+        bar = "❤️"*(cp//10) + "🤍"*(10-cp//10)
+        await send(cid, f"💘 {n1} + {n2} = {sn}\n\n{cp}%\n{bar}\n\n{random.choice(SHIP_REACTIONS)}"); return {"status": "ok"}
 
-    # ═══════ /8ball ═══════
     if cmd in ("/8ball", "/ball", "/шар"):
-        if not args:
-            await send_message(chat_id, "задай вопрос /8ball стоит ли пить кофе")
-            return {"status": "ok"}
-        answer = random.choice(EIGHTBALL_ANSWERS)
-        await send_message(chat_id, f"🎱 {args}\n\nответ: {answer}")
-        return {"status": "ok"}
+        if not args: await send(cid, "/8ball вопрос"); return {"status": "ok"}
+        await send(cid, f"🎱 {args}\n\n{random.choice(BALL_ANSWERS)}"); return {"status": "ok"}
 
-    # ═══════ /random ═══════
     if cmd in ("/random", "/rand"):
         try:
-            parts = args.split() if args else ["100"]
-            if len(parts) == 1:
-                num = random.randint(1, int(parts[0]))
-                await send_message(chat_id, f"🎲 {num} (от 1 до {parts[0]})")
-            else:
-                num = random.randint(int(parts[0]), int(parts[1]))
-                await send_message(chat_id, f"🎲 {num} (от {parts[0]} до {parts[1]})")
-        except Exception:
-            await send_message(chat_id, "формат /random 100 или /random 1 50")
+            p = args.split() if args else ["100"]
+            n = random.randint(1, int(p[0])) if len(p)==1 else random.randint(int(p[0]), int(p[1]))
+            await send(cid, f"🎲 {n}")
+        except: await send(cid, "/random 100 или /random 1 50")
         return {"status": "ok"}
 
-    # ═══════ /coin ═══════
     if cmd in ("/coin", "/монетка"):
-        result = random.choice(["орёл 🦅", "решка 🪙"])
-        await send_message(chat_id, f"подкидываю...\n\nвыпало: {result}")
-        return {"status": "ok"}
+        await send(cid, f"🪙 {random.choice(['орёл 🦅','решка'])}"); return {"status": "ok"}
 
-    # ═══════ /choose ═══════
     if cmd in ("/choose", "/выбери"):
-        if not args or "," not in args:
-            await send_message(chat_id, "пиши через запятую /choose пицца, суши, бургер")
-            return {"status": "ok"}
-        options = [o.strip() for o in args.split(",") if o.strip()]
-        choice = random.choice(options)
-        await send_message(chat_id, f"я выбираю: {choice} 👈")
-        return {"status": "ok"}
+        if not args or "," not in args: await send(cid, "/choose а, б, в"); return {"status": "ok"}
+        await send(cid, f"выбираю: {random.choice([o.strip() for o in args.split(',') if o.strip()])} 👈"); return {"status": "ok"}
 
-    # ═══════ /iq ═══════
     if cmd == "/iq":
-        reply = message.get("reply_to_message")
-        target_name = reply["from"].get("first_name", "чел") if reply else user_name
-        iq = random.randint(20, 200)
-        if iq < 50:
-            comment = "это даже не амёба"
-        elif iq < 80:
-            comment = "ну такое..."
-        elif iq < 100:
-            comment = "средненько бро"
-        elif iq < 130:
-            comment = "норм мозги"
-        elif iq < 170:
-            comment = "умник бля"
+        rr = msg.get("reply_to_message"); tu = rr["from"] if rr else user; tn = tu.get("first_name", "чел")
+        if is_creator(tu): iq = random.randint(180,250); cm = "БАТЯ ЛЕГЕНДА 👑"
+        elif is_friend(tu): iq = random.randint(140,200); cm = "бро создателя умный чел 🤝"
         else:
-            comment = "ИИНШТЕЙН ВЕРНУЛСЯ"
-        await send_message(chat_id, f"🧠 iq {target_name}: {iq}\n\n{comment}")
-        return {"status": "ok"}
+            iq = random.randint(20,200)
+            cm = {iq<50:"амёба",iq<80:"такое",iq<100:"средне",iq<130:"норм",iq<170:"умник бля"}.get(True,"ИИНШТЕЙН") if iq<170 else "ИИНШТЕЙН"
+            if iq<50: cm="амёба"
+            elif iq<80: cm="такое"
+            elif iq<100: cm="средне"
+            elif iq<130: cm="норм"
+            elif iq<170: cm="умник бля"
+            else: cm="ИИНШТЕЙН"
+        await send(cid, f"🧠 {tn}: {iq}\n\n{cm}"); return {"status": "ok"}
 
-    # ═══════ /vibe ═══════
     if cmd == "/vibe":
-        vibes = ["🌈 имба", "💀 трэш", "🔥 огонь", "😴 скучно",
-                 "🎉 пати тайм", "🌧 депрессия", "⚡ электрика", "🍕 хочется кушать"]
-        vibe = random.choice(vibes)
-        percent = random.randint(50, 100)
-        await send_message(chat_id, f"вайб чата: {vibe}\nсила вайба: {percent}%")
-        return {"status": "ok"}
+        v = random.choice(["🌈 имба","💀 трэш","🔥 огонь","😴 скучно","🎉 пати","🌧 депрессия","⚡ электрика","🍕 жрать хочу"])
+        await send(cid, f"вайб чата: {v}\nсила: {random.randint(50,100)}%"); return {"status": "ok"}
 
-    # ═══════ /gay ═══════
     if cmd in ("/gay", "/гей"):
-        reply = message.get("reply_to_message")
-        target_name = reply["from"].get("first_name", "чел") if reply else user_name
-        percent = random.randint(0, 100)
-        bar = "🏳️‍🌈" * (percent // 10) + "⬛" * (10 - percent // 10)
-        comment = "ну окей" if percent < 50 else "пиздец" if percent > 90 else "норм"
-        await send_message(chat_id, f"🌈 геометр для {target_name}\n\n{percent}%\n{bar}\n\n{comment}")
-        return {"status": "ok"}
+        rr = msg.get("reply_to_message"); tu = rr["from"] if rr else user; tn = tu.get("first_name", "чел")
+        if is_creator(tu): p=random.randint(0,3); cm="натурал на макс 👑"
+        elif is_friend(tu): p=random.randint(0,10); cm="бро норм"
+        else: p=random.randint(0,100); cm="ну ок" if p<50 else "пиздец" if p>90 else "норм"
+        await send(cid, f"🌈 {tn}\n\n{p}%\n{'🏳️‍🌈'*(p//10)}{'⬛'*(10-p//10)}\n\n{cm}"); return {"status": "ok"}
 
-    # ═══════ /compliment ═══════
     if cmd in ("/compliment", "/комплимент"):
-        reply = message.get("reply_to_message")
-        target_name = reply["from"].get("first_name", "чел") if reply else user_name
-        await send_message(chat_id, f"для {target_name}: {random.choice(COMPLIMENTS)}")
-        return {"status": "ok"}
+        rr = msg.get("reply_to_message"); tn = (rr["from"] if rr else user).get("first_name", "чел")
+        await send(cid, f"для {tn}: {random.choice(COMPLIMENTS)}"); return {"status": "ok"}
 
-    # ═══════ /fact ═══════
     if cmd == "/fact":
-        await send_action(chat_id, "typing")
-        fact_msgs = [
-            {"role": "system", "content": (
-                "ты ориен. придумай или вспомни прикольный неочевидный факт "
-                "из IT гейминга науки или жизни. 2-3 строчки маленькими буквами без точек"
-            )},
-            {"role": "user", "content": "расскажи факт"}
-        ]
-        fact = await ai_client.get_text_response(fact_msgs, preferred_model="primary")
-        await send_message(chat_id, f"💡 факт дня:\n\n{format_style(fact)}")
-        return {"status": "ok"}
+        await typing(cid)
+        f = await ai.text([{"role":"system","content":"придумай прикольный факт из IT/гейминга/науки 2-3 строчки маленькими без точек"},
+            {"role":"user","content":"факт"}], pref="primary")
+        await send(cid, f"💡\n\n{fmt(f)}"); return {"status": "ok"}
 
-    # ═══════ /quote ═══════
     if cmd in ("/quote", "/цитата"):
-        await send_action(chat_id, "typing")
-        quote_msgs = [
-            {"role": "system", "content": (
-                "ты ориен. придумай дерзкую цитату от себя про код жизнь или айти. "
-                "коротко 1-2 строчки без точек маленькими буквами"
-            )},
-            {"role": "user", "content": "цитату давай"}
-        ]
-        quote = await ai_client.get_text_response(quote_msgs, preferred_model="primary")
-        await send_message(chat_id, f"💬 цитата дня от ориена:\n\n«{format_style(quote)}»\n\n— OrienAI 😎")
-        return {"status": "ok"}
+        await typing(cid)
+        q = await ai.text([{"role":"system","content":"дерзкая цитата про код/жизнь 1-2 строчки без точек"},
+            {"role":"user","content":"цитату"}], pref="primary")
+        await send(cid, f"💬 «{fmt(q)}»\n\n— OrienAI 😎"); return {"status": "ok"}
 
-    # ═══════ /help ═══════
     if cmd == "/help":
-        await send_message(chat_id, """⚡ OrienAI v4.1
+        await send(cid, """⚡ OrienAI v4.2
 
-💬 общение:
-/provider /mood /settings /reset /status
-
-🎨 картинки:
-/img /me /imgmodel /getava
-
-🎬 ютуб:
-/yt запрос
-
-💻 код:
-/analyze /task
-
-👥 юзеры:
-/profile /mute
+💬 /provider /mood /settings /reset /status
+🎨 /img /me /imgmodel /getava
+🎬 /yt запрос
+💻 /analyze /task
+👥 /profile /mute /creator
 
 🎮 ФАН:
-/roast — прожарить (reply)
-/ship — шипперить (reply)
-/8ball вопрос — магический шар
-/random 100 — рандом число
-/coin — монетка
-/choose а, б, в — выбор
-/iq — измерить (reply)
-/vibe — вайб чата
-/gay — геометр (reply)
-/compliment — комплимент (reply)
-/fact — факт дня
-/quote — цитата от ориена
+/roast /ship /8ball /random /coin
+/choose /iq /vibe /gay /compliment
+/fact /quote
 
-кидай картинки — я вижу 👁
-просто пиши — отвечу""")
-        return {"status": "ok"}
+кидай картинки 👁 просто пиши"""); return {"status": "ok"}
 
-    # ═══════ /start ═══════
     if cmd == "/start":
-        await send_message(chat_id, f"оо здарова {user_name.lower()} я orienai v4 пиши /help")
-        return {"status": "ok"}
+        await send(cid, f"оо здарова {uname.lower()} я orienai v4 пиши /help"); return {"status": "ok"}
 
-    # левая команда
-    if cmd is not None:
-        return {"status": "ok"}
+    if cmd is not None: return {"status": "ok"}
 
     # ОБЫЧНЫЙ ОТВЕТ
-    if should_respond(message, settings):
-        await send_action(chat_id, "typing")
-        image_data = await extract_image(message)
-        ai_text = await get_ai_response(chat_id, user_name, text, image_data_url=image_data)
-        await send_message(chat_id, ai_text)
+    if should_respond(msg, s):
+        await typing(cid)
+        img = await extract_img(msg)
+        at = await ai_response(cid, uname, text, img, creator_flag, friend_flag)
+        await send(cid, at)
 
     return {"status": "ok"}
 
-
 @app.get("/")
-async def root():
-    return {"status": "alive", "version": "4.1", "features": [
-        "vision", "youtube", "settings", "profiles", "code_analysis",
-        "smart_prompts", "avatars", "mute", "tasks", "fun_commands"
-    ]}
-
+async def root(): return {"status": "alive", "version": "4.2"}
 @app.get("/health")
-async def health():
-    return {"healthy": True}
+async def health(): return {"ok": True}
