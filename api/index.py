@@ -181,7 +181,7 @@ def chat_data(cid):
     return c
 
 async def save_chat(cid: int):
-    if not DB: return
+    if DB is None: return
     try:
         c = CHATS.get(cid)
         if not c: return
@@ -822,7 +822,7 @@ async def webhook(req: Request):
             f"стиль: *{s.get('style','хам')}*",
             f"мат: {'✅' if s.get('allow_swear') else '❌'}",
             f"задач: *{len(c.get('tasks',[]))}*",
-            f"бд: {'✅' if DB else '❌'}",
+            f"бд: {'✅' if DB is not None else '❌'}",
             "", "*провайдеры:*"
         ] + [f"{'✅' if not st.disabled else '❌'} `{p.value}`" for p,st in PROV_STATUS.items()]
         await send(cid, "\n".join(lines))
@@ -1102,7 +1102,7 @@ async def webhook(req: Request):
 
 @app.get("/")
 async def root():
-    return {"status": "alive", "version": "5.0", "db": "connected" if DB else "off"}
+    return {"status": "alive", "version": "5.0", "db": "connected" if DB is not None else "off"}
 
 @app.get("/health")
 async def health():
