@@ -27,9 +27,7 @@ from economy import (
     WALLETS, MARRIAGES, CHAT_MEMBERS, save_wallet, save_marriages, save_members
 )
 
-# ══════════════════════════════════════════════════════════════════════════════
-# КОНФИГ
-# ══════════════════════════════════════════════════════════════════════════════
+
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENROUTER_KEY = os.getenv("OPENROUTER_KEY")
 MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://Today_Idk:TpdauT434odayTodayToday23@cluster0.rlgkop5.mongodb.net/OrienAI?retryWrites=true&w=majority&appName=Cluster0")
