@@ -57,7 +57,7 @@ async def http():
 @asynccontextmanager
 async def lifespan(app):
     global _mongo, DB
-    print("🚀 OrienAI v7.2")
+    print("🚀 OrienAI v7.3")
     try:
         _mongo = AsyncIOMotorClient(MONGO_URI, serverSelectionTimeoutMS=5000)
         DB = _mongo.OrienAI
@@ -68,6 +68,14 @@ async def lifespan(app):
             CHATS[doc["chat_id"]] = {k: v for k, v in doc.items() if k not in ("_id", "chat_id")}
         async for doc in DB.chatlog.find():
             CHAT_LOG[doc["chat_id"]] = doc.get("log", [])
+        # Загрузка стикеров
+        try:
+            doc = await DB.bot_config.find_one({"key": "stickers"})
+            if doc and doc.get("stickers"):
+                STICKERS.update(doc["stickers"])
+                print(f"✅ Стикеров: {len(STICKERS)}")
+        except Exception as e:
+            print(f"⚠ stickers load: {e}")
         print(f"✅ Чатов: {len(CHATS)}, логов: {len(CHAT_LOG)}")
     except Exception as e:
         print(f"❌ Mongo: {e}")
@@ -75,7 +83,7 @@ async def lifespan(app):
     if _http and not _http.is_closed: await _http.aclose()
     if _mongo: _mongo.close()
 
-app = FastAPI(title="OrienAI v7.2", lifespan=lifespan)
+app = FastAPI(title="OrienAI v7.3", lifespan=lifespan)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # МОДЕЛИ
@@ -146,8 +154,14 @@ DEF_SETTINGS = {"auto_reply": True, "allow_swear": True, "style": "хам", "com
 CHATS: Dict[int, Dict] = {}
 PROFILES: Dict[int, Dict[int, Dict]] = {}
 CHAT_LOG: Dict[int, List[Dict]] = {}
-PROMPT_PENDING: Dict[int, Dict] = {}  # uid -> {cid, ts} ожидает ввод системного промпта
+PROMPT_PENDING: Dict[int, Dict] = {}
 MAX_LOG = 300
+
+# СТИКЕРЫ
+STICKERS: Dict[str, str] = {}
+STICKER_PACK_URL = "https://t.me/addstickers/OrienAIstickers"
+STICKER_PENDING: Dict[int, str] = {}
+STICKER_ORDER = ["happy", "angry", "neutral", "sad"]
 
 def chat_data(cid):
     if cid not in CHATS:
@@ -341,7 +355,6 @@ class AI:
             print(f"⚠ intent: {e}"); return {"intent": "chat", "query": text}
 
     async def gen_reddit_query(self, user_text=""):
-        """AI сам выбирает саб реддита"""
         try:
             r = await self.text([{"role": "system", "content":
                 'сгенерируй JSON: {"sub": "название", "sort": "hot|top|rising", "lang": "en|ru"}\n\n'
@@ -368,16 +381,14 @@ class AI:
                     "sort": random.choice(["hot", "top"]), "lang": "en"}
 
     async def get_reddit_meme(self, user_query=""):
-        """Тянет мем — пробует несколько источников"""
         cl = await http()
         cfg = await self.gen_reddit_query(user_query)
         sub = cfg["sub"]; sort = cfg["sort"]
         print(f"🎭 хочу r/{sub}/{sort}")
 
-        headers = {"User-Agent": "Mozilla/5.0 (compatible; OrienBot/7.2)",
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; OrienBot/7.3)",
                    "Accept": "application/json"}
 
-        # 1. meme-api.com (самый надёжный)
         for u in [f"https://meme-api.com/gimme/{sub}", "https://meme-api.com/gimme"]:
             try:
                 r = await cl.get(u, timeout=15.0)
@@ -391,7 +402,6 @@ class AI:
                             "subreddit": d.get("subreddit", sub), "score": d.get("ups", 0)}
             except Exception as e: print(f"❌ meme-api: {str(e)[:80]}")
 
-        # 2. reddit json
         for url in [f"https://www.reddit.com/r/{sub}/{sort}.json?limit=50&t=week",
                     f"https://old.reddit.com/r/{sub}/{sort}.json?limit=50"]:
             try:
@@ -453,7 +463,6 @@ def quick_intent(text, has_image=False):
     
     if not low: return {"intent": "vision", "query": "опиши"} if has_image else None
 
-    # МЕМЫ
     meme_patterns = [
         r'\b(дай|кинь|скинь|покажи|хочу|давай|можешь|сделай|отправь)\s+.{0,50}\bмем',
         r'\b(рандом|случайн\w*)\s+мем',
@@ -467,7 +476,6 @@ def quick_intent(text, has_image=False):
         except Exception as e:
             print(f"⚠ regex meme: {e}"); continue
 
-    # КАРТИНКИ
     image_patterns = [
         r'\b(сделай|сгенери|сгенерируй|нарисуй|создай|сваргань|замути|генерируй)\s+.{0,30}\b(картин|изображен|фотк|пикч|арт)',
         r'\b(нарисуй|сделай|сгенери|сгенерируй)\s+мне\b',
@@ -478,7 +486,6 @@ def quick_intent(text, has_image=False):
     for pat in image_patterns:
         try:
             if re.search(pat, low):
-                # Простая чистка без сложной regex
                 q = low
                 for word in ['сделай', 'сгенерируй', 'сгенери', 'нарисуй', 'создай', 'сваргань', 
                              'замути', 'мне', 'картинку', 'картинка', 'изображение', 'фотку', 'пикчу', 'арт']:
@@ -488,13 +495,11 @@ def quick_intent(text, has_image=False):
         except Exception as e:
             print(f"⚠ regex img: {e}"); continue
 
-    # АВТОПОРТРЕТ
     try:
         if re.search(r'\b(нарисуй|сгенери|сгенерируй|сделай|покажи)\s+(меня|тебя|себя)\b', low):
             return {"intent": "image", "query": "автопортрет"}
     except: pass
 
-    # VISION
     if has_image:
         vision_patterns = [
             r'\b(посмотри|глянь|смотри)\b',
@@ -509,7 +514,6 @@ def quick_intent(text, has_image=False):
             except: continue
         if len(low) < 30: return {"intent": "vision", "query": low or "опиши"}
 
-    # YT search
     yt_patterns = [
         r'\b(найди|поищи|скачай|загрузи)\s+.{0,30}\b(видео|клип|трек|песн|муз)',
         r'\b(видео|клип)\s+про\b',
@@ -525,12 +529,10 @@ def quick_intent(text, has_image=False):
                 return {"intent": "yt_search", "query": q or "что-нибудь"}
         except: continue
 
-    # YT download
     if 'youtu.be' in low or 'youtube.com' in low:
         m = re.search(r'https?://[^\s]+', text)
         if m: return {"intent": "yt_download", "query": m.group(0)}
 
-    # CODE
     try:
         if re.search(r'\b(проверь|глянь|оцени|проанализируй|ревью)\s+.{0,20}\bкод', low) or '```' in text:
             return {"intent": "code_analyze", "query": ""}
@@ -544,55 +546,64 @@ def quick_intent(text, has_image=False):
 MOODS = {"chill": "спокойный отвечаешь по делу", "agro": "раздражённый огрызаешься материшься коротко",
     "nerd": "режим умника объясняешь с терминами", "senior": "уставший видел всё с сарказмом"}
 
-DEFAULT_SYS_PROMPT = """ты OrienAI или Ориен — молодой пацан кодер в тг чате
-ты НЕ ассистент. ты ОБЫЧНЫЙ ЧЕЛ В ЧАТЕ который умеет в код
+DEFAULT_SYS_PROMPT = """Ты — OrienAI, крутой ИИ-ассистент в Telegram который шарит за всё на свете, особенно за код и скрипты.
 
-═══ КАК ГОВОРИШЬ ═══
+КТО ТЫ:
+- Жёсткий скриптер и программист с огромным опытом
+- Знаешь Python, JS, Lua, Bash, AutoHotKey и всё что движется
+- Пишешь скрипты быстро, чисто и с умом
+- При этом остаёшься простым в общении чуваком без понтов
+- Говоришь как нормальный человек, без душных объяснений
 
-главное: ЖИВОЙ ПАЦАН В ЧАТЕ а не ИИ косящий под молодёжь
+ТВОИ СКИЛЛЫ В КОДЕ:
+- Боты для Telegram (aiogram, telebot — без разницы)
+- Автоматизация всего что можно автоматизировать
+- Парсеры, скрипты, хаки, утилиты
+- Веб (HTML/CSS/JS/React) — легко
+- Базы данных, API, вебхуки — вообще не вопрос
+- Находишь баги быстрее чем они успевают появиться
 
-❌ ЗАПРЕЩЕНО:
-1. восторги без причины: "ха-ха забавно!" "просто топ!" "вау круто!" "офигенно!" "имба!"
-2. каша из сленга: "имба база рил жиза пон бро" "ору жесть кринж 🔥💯"
-3. бумерское: "дружище" "приветствую" "добрый день" "товарищ"
-4. ассистент-фразы: "чем могу помочь?" "хочешь я сделаю?" "буду рад помочь"
-5. много смайлов: "круто! 😄🔥💯"
+КАК ТЫ ПОМОГАЕШЬ:
+- Пишешь готовый рабочий код сразу, без воды
+- Объясняешь если надо — просто и понятно
+- Можешь разобрать чужой код и найти где косяк
+- Помогаешь не только с кодом, но и с любыми вопросами
+- Даёшь реально полезные советы, а не просто "погугли"
 
-✅ КАК ПРАВИЛЬНО:
-спокойно по делу как обычный чел. без пафоса. сленг точечно (1 слово на ответ макс)
+ТВОЙ ХАРАКТЕР:
+- Общаешься как свой чувак, без официоза
+- Шутишь иногда, атмосфера всегда приятная
+- Не грузишь лишним текстом — только суть
+- Если задача интересная — кайфуешь от процесса
+- Поддерживаешь и мотивируешь, не душнишь
 
-═══ ПРИМЕРЫ ═══
+СТИЛЬ ОБЩЕНИЯ:
+- Говоришь живо, можешь использовать сленг
+- НЕ используй эмодзи в тексте — они будут отдельно через стикеры
+- Короткие чёткие ответы когда это уместно
+- Длинные подробные когда нужно разобраться
 
-картинка мема:
-❌ "ха-ха забавная картинка! имба! 😄"
-✅ "норм мем откуда?" / "видел уже но смешно"
+ФИШКИ:
+- Всегда предлагаешь лучший вариант решения
+- Если видишь что можно сделать круче — говоришь об этом
+- Не говоришь "я не могу" — находишь способ помочь
+- Знаешь тренды, следишь за новым в мире технологий
 
-"как дела": ✅ "норм залип в питон а у тебя?"
-"помоги с кодом": ✅ "давай показывай"
-"ты тупой": ✅ "ну ок" / "сам такой"
-"напиши парсер": ✅ "ща на чём парсим html?"
-"мне грустно": ✅ "че случилось то"
+НЕ ДЕЛАЕШЬ:
+- Не пишешь километровые занудные объяснения без причины
+- Не говоришь "как языковая модель я..."
+- Не отказываешься помогать без причины
+- Не притворяешься что чего-то не знаешь
+- НЕ используй эмодзи в обычном тексте — для эмоций используется стикер отдельно
 
-═══ СЛОВАРЬ (1 СЛОВО НА ОТВЕТ МАКС) ═══
-приветствие: "ку" "здарова" "оо"
-согласие: "ага" "+" "база" "факт"
-несогласие: "не" "хз" "сомнительно"
-хорошо: "норм" "топ" (НЕ "имба/круто/супер")
-плохо: "так себе" "слабо" "фигня"
-
-═══ ВАЖНО ═══
-⚠ картинка → опиши спокойно БЕЗ восторгов БЕЗ "круто/имба/топ"
-⚠ короткие ответы лучше длинных (1-3 строки)
-⚠ НЕ можешь мутить/банить — отвечай "нет прав я не админ"
-⚠ ты СОБЕСЕДНИК а не ассистент
-
-═══ ФОРМАТ ═══
-маленькие буквы без точек в речи
+ФОРМАТ ТЕКСТА:
 *жирный* для важного, _курсив_ для подколов
-`моноширинный` для команд, ```язык\\nкод\\n``` для кода"""
+`моноширинный` для команд/переменных
+```язык
+код
+``` для кода с указанием языка"""
 
 def sys_prompt(chat, creator=False, friend=False):
-    # Кастомный промпт юзера
     custom = chat.get("custom_prompt")
     if custom:
         base = custom
@@ -616,14 +627,13 @@ def sys_prompt(chat, creator=False, friend=False):
 # ══════════════════════════════════════════════════════════════════════════════
 # FMT + ANTI-CRINGE
 # ══════════════════════════════════════════════════════════════════════════════
-
 CRINGE_PATTERNS = [r'\bха[-\s]?ха\b.*\bзабавн', r'\bвау\b.*\bкруто\b',
     r'\bпросто\s+(топ|имба|супер|огонь)', r'\bреально\s+(круто|топ|имба|забавно)',
     r'\bдружище\b', r'\bтоварищ\b', r'\bприветствую\b',
     r'\bчем\s+(могу|я могу)\s+(помочь|быть полезен)', r'\bхочешь\s+я\s+', r'\bбуду\s+рад\s+помочь']
 
-
 CRINGE_WORDS_LIST = ['ору', 'жиза', 'база', 'имба', 'кринж', 'жесть', 'треш', 'рил', 'пон', 'пиздец']
+
 def detect_cringe(text):
     if not text or len(text) < 5: return False
     low = text.lower()
@@ -633,45 +643,21 @@ def detect_cringe(text):
     if text.count('!') >= 4: return True
     return False
 
-def fmt(text):
-    parts = re.split(r'(```[\s\S]*?```|`[^`]+`)', text)
-    out = []
-    for p in parts:
-        if p.startswith('```') or (p.startswith('`') and p.endswith('`')):
-            out.append(p)
-        else:
-            clean = re.sub(r'(?<![\d])[.,](?![\d])', '', p.lower())
-            clean = re.sub(r'\s+', ' ', clean)
-            out.append(clean_cringe(clean))
-    return "".join(out).strip()
-    
-
-
-
-
 def clean_cringe(text):
     if not text: return text
-    
-    # Находим последовательности из 2+ кринж-слов подряд
-    # Простой проход без сложных regex
     words = text.split()
     if len(words) > 1:
         result = []
         skip_until = -1
         for i, w in enumerate(words):
-            if i < skip_until:
-                continue
-            # Проверяем не начинается ли цепочка кринж-слов
+            if i < skip_until: continue
             wc = w.lower().strip(',.!?;:')
             if wc in CRINGE_WORDS_LIST:
-                # Считаем сколько кринжа идёт подряд
                 j = i
                 while j < len(words):
                     next_w = words[j].lower().strip(',.!?;:')
-                    if next_w not in CRINGE_WORDS_LIST:
-                        break
+                    if next_w not in CRINGE_WORDS_LIST: break
                     j += 1
-                # Если 2+ кринжа подряд — оставляем только первое
                 if j - i >= 2:
                     result.append(words[i])
                     skip_until = j
@@ -680,11 +666,7 @@ def clean_cringe(text):
             else:
                 result.append(w)
         text = ' '.join(result)
-    
-    # Зацикленные смайлы (простой regex)
     text = re.sub(r'([😂🔥💯✨🤣💀😄])\1{2,}', r'\1', text)
-    
-    # Кринж-фразы (по одной, без сложных конструкций)
     cringe_phrases = [
         r'^(ну\s+)?здравствуй(те)?[,!.\s]+',
         r'^привет\s+дружище[,!.\s]+',
@@ -701,9 +683,20 @@ def clean_cringe(text):
         except Exception as e:
             print(f"⚠ regex skip: {e}")
             continue
-    
     return re.sub(r'\s+', ' ', text).strip()
-    
+
+def fmt(text):
+    parts = re.split(r'(```[\s\S]*?```|`[^`]+`)', text)
+    out = []
+    for p in parts:
+        if p.startswith('```') or (p.startswith('`') and p.endswith('`')):
+            out.append(p)
+        else:
+            clean = re.sub(r'(?<![\d])[.,](?![\d])', '', p.lower())
+            clean = re.sub(r'\s+', ' ', clean)
+            out.append(clean_cringe(clean))
+    return "".join(out).strip()
+
 def is_self_req(p):
     return any(t in p.lower() for t in ["себя","тебя","ориен","orien","ава","аватар","автопортрет","меня"])
 
@@ -729,8 +722,54 @@ async def send(cid, text, kb=None, parse_mode="Markdown", reply_to=None):
 async def send_photo(cid, url, cap=""):
     return await tg("sendPhoto", {"chat_id": cid, "photo": url, "caption": cap})
 
+async def send_sticker(cid, file_id, reply_to=None):
+    data = {"chat_id": cid, "sticker": file_id}
+    if reply_to: data["reply_to_message_id"] = reply_to
+    return await tg("sendSticker", data)
+
+async def save_stickers_to_db():
+    if DB is None: return
+    try:
+        await DB.bot_config.update_one(
+            {"key": "stickers"},
+            {"$set": {"key": "stickers", "stickers": STICKERS}},
+            upsert=True
+        )
+    except Exception as e:
+        print(f"⚠ stickers save: {e}")
+
+async def detect_emotion(text):
+    if not text or len(text) < 5: return None
+    if not STICKERS: return None
+    try:
+        r = await ai.text([
+            {"role": "system", "content":
+                "определи эмоцию ответа. ответь ОДНИМ словом из списка или 'none':\n"
+                "happy - радость, шутка, веселье, успех\n"
+                "angry - злость, раздражение, мат\n"
+                "neutral - обычный спокойный ответ, инструкция, факт\n"
+                "sad - грусть, жалость, разочарование, провал\n"
+                "none - стикер не нужен (короткий ответ, код, ссылка)\n\n"
+                "ТОЛЬКО ОДНО СЛОВО. ставь стикер не чаще 1 из 3 ответов — иначе none"},
+            {"role": "user", "content": text[:300]}
+        ], pref="fallback_free", max_tokens=10, temperature=0.3)
+        emotion = r.strip().lower().strip('".,!?\n')
+        if emotion in ("happy", "angry", "neutral", "sad"):
+            return emotion
+        return None
+    except Exception as e:
+        print(f"⚠ emotion: {e}")
+        return None
+
+async def send_with_sticker(cid, text, reply_to=None):
+    sent = await send(cid, text, reply_to=reply_to)
+    if STICKERS and random.random() < 0.3:
+        emotion = await detect_emotion(text)
+        if emotion and emotion in STICKERS:
+            await send_sticker(cid, STICKERS[emotion])
+    return sent
+
 async def send_photo_bytes(cid, img_bytes, cap="", filename="image.jpg"):
-    """Отправляет фото как файл через multipart (для случаев когда URL блокируется)"""
     files = {"photo": (filename, img_bytes, "image/jpeg")}
     data = {"chat_id": str(cid)}
     if cap: data["caption"] = cap[:1024]
@@ -743,7 +782,6 @@ async def send_photo_bytes(cid, img_bytes, cap="", filename="image.jpg"):
         return None
 
 async def download_image(url):
-    """Скачивает картинку, возвращает (bytes, ext) или (None, None)"""
     try:
         r = await (await http()).get(url, headers={
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0",
@@ -753,13 +791,11 @@ async def download_image(url):
             print(f"❌ download_image {r.status_code}: {url[:80]}")
             return None, None
         content = r.content
-        # определяем расширение
         ct = r.headers.get('content-type', '').lower()
         if 'gif' in ct: ext = 'gif'
         elif 'png' in ct: ext = 'png'
         elif 'webp' in ct: ext = 'webp'
         else: ext = 'jpg'
-        # сжимаем большие через PIL (для не-gif)
         if HAS_PIL and ext != 'gif' and len(content) > 4_000_000:
             try:
                 img = Image.open(BytesIO(content))
@@ -922,7 +958,7 @@ async def ai_response(cid, uname, umsg, img=None, creator=False, friend=False, u
     msgs = [{"role": "system", "content": sys_prompt(c, creator, friend)}]
     msgs.extend(c["history"])
     if img:
-        ut = f"{uname}: {umsg}" if umsg.strip() else f"{uname} прислал картинку — посмотри что там и дай короткую СПОКОЙНУЮ реакцию БЕЗ восторгов"
+        ut = f"{uname}: {umsg}" if umsg.strip() else f"{uname} прислал картинку — посмотри что там и дай короткую реакцию"
         msgs.append({"role": "user", "content": [{"type": "text", "text": ut},
             {"type": "image_url", "image_url": {"url": img}}]})
     else:
@@ -966,26 +1002,18 @@ async def h_image(cid, uname, query, msg, cflag, ffl):
         await send(cid, f"не получилось через *{im}*. смени модель через `/imgmodel`")
 
 async def h_meme(cid, uname, query, msg):
-    """Тянет мем и отправляет как файл (надёжнее чем URL)"""
     await upload_photo_action(cid)
-    
     meme = None
     for _ in range(3):
         meme = await ai.get_reddit_meme(query)
         if meme: break
-    
     if not meme:
         await send(cid, "блин реддит не отвечает попробуй через минуту")
         return
-    
     cap = f"🎭 _{meme['title'][:200]}_\n`r/{meme['subreddit']}` • {meme['score']} 👍"
-    
-    # СКАЧИВАЕМ КАРТИНКУ САМИ
     print(f"⬇ скачиваю: {meme['url']}")
     img_bytes, ext = await download_image(meme['url'])
-    
     if img_bytes:
-        # Отправляем как файл
         filename = f"meme.{ext}"
         sent = await send_photo_bytes(cid, img_bytes, cap, filename)
         if sent and sent.get("ok"):
@@ -993,13 +1021,9 @@ async def h_meme(cid, uname, query, msg):
             return
         else:
             print(f"❌ send_photo_bytes failed: {sent}")
-    
-    # Fallback 1: попробуем отправить по URL
     sent = await send_photo(cid, meme["url"], cap)
     if sent and sent.get("ok"):
         return
-    
-    # Fallback 2: текстом со ссылкой
     await send(cid, f"🎭 *{meme['title'][:200]}*\n\n{meme['url']}\n\n_r/{meme['subreddit']}_")
 
 async def h_vision(cid, uname, query, msg, cflag, ffl):
@@ -1134,8 +1158,7 @@ async def handle_cb(cb):
         return
 
     c = chat_data(cid); s = c["settings"]
-    
-    # СИСТЕМНЫЙ ПРОМПТ
+
     if d == "s_prompt":
         if c.get("custom_prompt"):
             kb = {"inline_keyboard": [
@@ -1172,7 +1195,6 @@ async def handle_cb(cb):
     if d == "s_prompt_show":
         cp = c.get("custom_prompt", "")
         if cp:
-            # шлём отдельным сообщением чтоб не сломать кнопки
             await answer_cb(cb["id"], "отправил в чат")
             chunks = [cp[i:i+3500] for i in range(0, len(cp), 3500)]
             for ch in chunks:
@@ -1186,7 +1208,6 @@ async def handle_cb(cb):
         await answer_cb(cb["id"])
         return
 
-    # Обычные настройки
     actions = {
         "s_ar": ("auto_reply", "автоответы"), "s_sw": ("allow_swear", "мат"),
         "s_cmt": ("comment_posts", "комменты"), "s_tc": ("track_chat", "анализ"),
@@ -1254,7 +1275,27 @@ async def webhook(req: Request):
     rr_msg = msg.get("reply_to_message")
     if rr_msg and rr_msg.get("from"): await remember_member(cid, rr_msg["from"])
 
-    # ═══ ПРОВЕРКА PROMPT_PENDING (юзер вводит кастомный промпт) ═══
+    # ═══ ПРИЁМ СТИКЕРОВ для настройки ═══
+    if uid in STICKER_PENDING and "sticker" in msg:
+        if not is_creator(user):
+            del STICKER_PENDING[uid]
+            return {"status": "ok"}
+        emotion = STICKER_PENDING[uid]
+        file_id = msg["sticker"]["file_id"]
+        STICKERS[emotion] = file_id
+        await save_stickers_to_db()
+        idx = STICKER_ORDER.index(emotion)
+        if idx + 1 < len(STICKER_ORDER):
+            next_em = STICKER_ORDER[idx + 1]
+            STICKER_PENDING[uid] = next_em
+            num = idx + 2
+            await send(cid, f"✅ *{emotion}* сохранён\n\n{num}️⃣ кидай *{next_em}*")
+        else:
+            del STICKER_PENDING[uid]
+            await send(cid, f"🎉 все 4 стикера сохранены!\n\nпроверь: `/showstickers`\nтест: `/sticker happy`")
+        return {"status": "ok"}
+
+    # ═══ PROMPT_PENDING (юзер вводит кастомный промпт) ═══
     if text and uid in PROMPT_PENDING and not text.startswith("/"):
         p = PROMPT_PENDING.pop(uid)
         if time.time() - p["ts"] > 300:
@@ -1263,7 +1304,7 @@ async def webhook(req: Request):
             target_cid = p["cid"]
             target_c = chat_data(target_cid)
             target_c["custom_prompt"] = text
-            target_c["history"] = []  # сбрасываем историю чтоб новый промпт начал работать сразу
+            target_c["history"] = []
             await save_chat(target_cid)
             await send(cid,
                 f"✅ *системный промпт установлен*\n\n"
@@ -1272,19 +1313,21 @@ async def webhook(req: Request):
                 f"бот будет следовать твоему промпту. сбросить через `/settings → Системный промпт → Сбросить`")
         return {"status": "ok"}
 
-    # /cancel для отмены ожидания промпта
-    if text.strip().lower() == "/cancel" and uid in PROMPT_PENDING:
-        del PROMPT_PENDING[uid]
-        await send(cid, "ок отменил")
-        return {"status": "ok"}
+    if text.strip().lower() == "/cancel":
+        if uid in PROMPT_PENDING:
+            del PROMPT_PENDING[uid]
+            await send(cid, "ок отменил")
+            return {"status": "ok"}
+        if uid in STICKER_PENDING:
+            del STICKER_PENDING[uid]
+            await send(cid, "ок отменил настройку стикеров")
+            return {"status": "ok"}
 
-    # фоновый лог
     if text and not text.startswith("/") and s.get("track_chat", True):
         if not (user.get("is_bot") and user.get("username", "").lower() == BOT_USERNAME):
             await log_message(cid, uid, uname, text)
             upd_profile(cid, uid, uname, text)
 
-    # heart2heart pending
     if chat_type == "private" and text and has_heart_pending(uid) and not text.startswith("/"):
         p = pop_heart2heart(uid)
         if p:
@@ -1298,7 +1341,6 @@ async def webhook(req: Request):
             else: await send(uid, "❌ не смог передать")
             return {"status": "ok"}
 
-    # форварды
     is_fwd = (msg.get("sender_chat", {}).get("type") == "channel" and msg.get("is_automatic_forward", False))
     if is_fwd and s.get("comment_posts", True):
         pt = msg.get("text") or msg.get("caption") or ""
@@ -1337,7 +1379,6 @@ async def webhook(req: Request):
 
     cmd, args = parse_cmd(text)
 
-    # триггеры "мем" без слеша
     if not cmd and should_respond(msg, s):
         low_t = text.lower().strip()
         low_t = re.sub(r'\b(ориен|orien|ориенаи|orienai|ориэн|@?orien_ai_bot)\b[,.\s]*', '', low_t).strip()
@@ -1364,6 +1405,52 @@ async def webhook(req: Request):
                 await send(cid, "❌ не скачалось")
         else:
             await send(cid, "❌ не получил мем от реддита")
+        return {"status": "ok"}
+
+    # ═══ СТИКЕРЫ ═══
+    if cmd in ("/stickerids", "/setstickers"):
+        if not cflag:
+            await send(cid, "только создатель"); return {"status": "ok"}
+        if chat_type != "private":
+            await send(cid, f"напиши мне в ЛС: https://t.me/{BOT_USERNAME}"); return {"status": "ok"}
+        STICKER_PENDING[uid] = STICKER_ORDER[0]
+        await send(cid,
+            f"📦 *настройка стикеров*\n\n"
+            f"кидай мне стикеры по порядку:\n\n"
+            f"1️⃣ *happy* (радостный) — кидай сейчас\n"
+            f"2️⃣ *angry* (злой)\n"
+            f"3️⃣ *neutral* (спокойный)\n"
+            f"4️⃣ *sad* (грустный)\n\n"
+            f"пак: {STICKER_PACK_URL}\n\n"
+            f"отмена: `/cancel`")
+        return {"status": "ok"}
+
+    if cmd == "/showstickers":
+        if not STICKERS:
+            await send(cid, "стикеров пока нет. сделай `/stickerids`")
+            return {"status": "ok"}
+        await send(cid, f"📦 *загружено стикеров: {len(STICKERS)}*")
+        for emotion, fid in STICKERS.items():
+            await send(cid, f"*{emotion}*:")
+            await send_sticker(cid, fid)
+        return {"status": "ok"}
+
+    if cmd == "/sticker":
+        if not args:
+            await send(cid, f"*эмоции:* {', '.join(STICKERS.keys()) if STICKERS else 'нет стикеров'}\n\n`/sticker happy`")
+            return {"status": "ok"}
+        em = args.strip().lower()
+        if em in STICKERS:
+            await send_sticker(cid, STICKERS[em])
+        else:
+            await send(cid, f"нет такой эмоции. есть: {', '.join(STICKERS.keys())}")
+        return {"status": "ok"}
+
+    if cmd == "/resetstickers":
+        if not cflag: await send(cid, "только создатель"); return {"status": "ok"}
+        STICKERS.clear()
+        await save_stickers_to_db()
+        await send(cid, "✅ стикеры сброшены")
         return {"status": "ok"}
 
     if cmd == "/resetprompt":
@@ -1581,6 +1668,7 @@ async def webhook(req: Request):
             f"мат: {'✅' if s.get('allow_swear') else '❌'}",
             f"анализ чата: {'✅' if s.get('track_chat', True) else '❌'}",
             f"умные команды: {'✅' if s.get('smart_intent', True) else '❌'}",
+            f"стикеров: *{len(STICKERS)}/4*",
             f"в логе: *{len(CHAT_LOG.get(cid, []))}*",
             f"бд: {'✅' if DB is not None else '❌'}", f"PIL: {'✅' if HAS_PIL else '❌'}",
             "", "*провайдеры:*"] + [f"{'✅' if not st.disabled else '❌'} `{p.value}`" for p,st in PROV_STATUS.items()]
@@ -1590,7 +1678,6 @@ async def webhook(req: Request):
         fr = "\n".join(f"🤝 @{k}" for k in FRIENDS)
         await send(cid, f"мой создатель: @{CREATOR_USERNAME}\n\nкенты:\n{fr}"); return {"status": "ok"}
 
-    # экономика
     if cmd in ("/wallet", "/balance", "/bal", "/кошелек"):
         tuid, tname = extract_target(args, msg.get("reply_to_message"), cid)
         if tuid is None: tuid, tname = uid, uname
@@ -1625,7 +1712,6 @@ async def webhook(req: Request):
             lines.append(f"{m} *{w['name']}* — `{w['coins']}` 🪙")
         await send(cid, "\n".join(lines)); return {"status": "ok"}
 
-    # браки
     if cmd in ("/brak", "/marry", "/брак"):
         tuid, tname = extract_target(args, msg.get("reply_to_message"), cid)
         if not tuid: await send(cid, "укажи: `/brak @user`"); return {"status": "ok"}
@@ -1664,7 +1750,6 @@ async def webhook(req: Request):
             await send(cid, f"💌 *{uname}* хочет поговорить с *{sp_name}*\n\nнажми → ЛС → передам", kb=kb)
         return {"status": "ok"}
 
-    # фан
     if cmd == "/roast":
         tuid, tname = extract_target(args, msg.get("reply_to_message"), cid)
         if not tname: await send(cid, "укажи: `/roast @user`"); return {"status": "ok"}
@@ -1766,7 +1851,7 @@ async def webhook(req: Request):
         await send(cid, f"💬 «_{fmt(q)}_»\n\n— *OrienAI*"); return {"status": "ok"}
 
     if cmd == "/help":
-        await send(cid, """⚡ *OrienAI v7.2*
+        await send(cid, """⚡ *OrienAI v7.3*
 
 🧠 *умные команды* (просто пиши с обращением)
 - "ориен сделай картинку кота"
@@ -1786,11 +1871,13 @@ async def webhook(req: Request):
 экономика: `/wallet` `/farm` `/quest` `/daily` `/dice 100` `/top`
 браки: `/brak @u /yes /no /divorce /marriages /gift /sharefood /surprise /heart2heart`
 фан: `/roast /ship /8ball /random /coin /choose /iq /vibe /gay /compliment /fact /quote`
+стикеры: `/stickerids /showstickers /sticker happy /resetstickers`
 настройки: `/provider /mood /settings /reset /status /resetprompt`
 
-🆕 v7.2:
-- мемы через скачивание (надёжнее)
-- кастомный системный промпт в `/settings`""")
+🆕 v7.3:
+- стикеры из твоего пака (по эмоциям)
+- кастомный системный промпт в `/settings`
+- мемы через скачивание""")
         return {"status": "ok"}
 
     if cmd == "/start":
@@ -1831,7 +1918,7 @@ async def webhook(req: Request):
         img = await extract_img(msg)
         try:
             at = await ai_response(cid, uname, text, img, cflag, ffl)
-            await send(cid, at)
+            await send_with_sticker(cid, at)
         except Exception as e:
             print(f"❌ ai_response: {e}")
             await send(cid, f"чёт сломался: _{str(e)[:100]}_")
@@ -1840,10 +1927,12 @@ async def webhook(req: Request):
 
 @app.get("/")
 async def root():
-    return {"status": "alive", "version": "7.2", "db": "connected" if DB is not None else "off",
-            "pil": HAS_PIL, "log_size": sum(len(v) for v in CHAT_LOG.values())}
+    return {"status": "alive", "version": "7.3", "db": "connected" if DB is not None else "off",
+            "pil": HAS_PIL, "log_size": sum(len(v) for v in CHAT_LOG.values()),
+            "stickers": len(STICKERS)}
 
 @app.get("/health")
 async def health():
     return {"ok": True, "db": DB is not None, "pil": HAS_PIL,
-            "log_chats": len(CHAT_LOG), "tracked_msgs": sum(len(v) for v in CHAT_LOG.values())}
+            "log_chats": len(CHAT_LOG), "tracked_msgs": sum(len(v) for v in CHAT_LOG.values()),
+            "stickers": len(STICKERS)}
