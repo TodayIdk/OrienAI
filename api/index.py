@@ -443,49 +443,98 @@ class AI:
 
 ai = AI()
 
-# ══════════════════════════════════════════════════════════════════════════════
-# QUICK INTENT
-# ══════════════════════════════════════════════════════════════════════════════
 def quick_intent(text, has_image=False):
     if not text: return None
-    low = re.sub(r'\b(ориен|orien|ориенаи|orienai|ориэн|@?orien_ai_bot)\b[,.\s]*', '', text.lower()).strip()
+    try:
+        low = re.sub(r'\b(ориен|orien|ориенаи|orienai|ориэн|@?orien_ai_bot)\b[,.\s]*', '', text.lower()).strip()
+    except Exception as e:
+        print(f"⚠ quick_intent clean: {e}")
+        low = text.lower().strip()
+    
     if not low: return {"intent": "vision", "query": "опиши"} if has_image else None
 
-    for pat in [r'\b(дай|кинь|скинь|покажи|хочу|давай|можешь|сделай|отправь)\s+.*\b(мем|мемчик|мемас|memes?)\b',
-                r'\b(рандом|случайн\w*)\s+мем', r'\bмем\s+(пожалуйста|плиз|please)',
-                r'^мем[ыас]?\s*$', r'\b(русск\w+|англ\w+|english)\s+мем']:
-        if re.search(pat, low): return {"intent": "meme", "query": low}
+    # МЕМЫ
+    meme_patterns = [
+        r'\b(дай|кинь|скинь|покажи|хочу|давай|можешь|сделай|отправь)\s+.{0,50}\bмем',
+        r'\b(рандом|случайн\w*)\s+мем',
+        r'\bмем\s+(пожалуйста|плиз|please)',
+        r'^мем[ыас]?\s*$',
+        r'\b(русск\w+|англ\w+|english)\s+мем',
+    ]
+    for pat in meme_patterns:
+        try:
+            if re.search(pat, low): return {"intent": "meme", "query": low}
+        except Exception as e:
+            print(f"⚠ regex meme: {e}"); continue
 
-    for pat in [r'\b(сделай|сгенери(руй)?|нарисуй|создай|сваргань|замути|генерируй)\s+.*\b(картин|изображен|фотк|пикч|арт|image)',
-                r'\b(нарисуй|сделай|сгенери)\s+мне\b',
-                r'\b(сделай|сгенери|нарисуй)\s+(кот|собак|дракон|девушк|парн|город|пейзаж|портрет)',
-                r'\b(хочу|давай)\s+картинк', r'\bкартинк\w*\s+(сделай|сгенери|нарисуй)']:
-        if re.search(pat, low):
-            q = re.sub(r'\b(сделай|сгенери(руй)?|нарисуй|создай|сваргань|замути|мне|картинку?|изображение|фотку|пикчу|арт)\b', '', low).strip()
-            return {"intent": "image", "query": q or "что-нибудь интересное"}
+    # КАРТИНКИ
+    image_patterns = [
+        r'\b(сделай|сгенери|сгенерируй|нарисуй|создай|сваргань|замути|генерируй)\s+.{0,30}\b(картин|изображен|фотк|пикч|арт)',
+        r'\b(нарисуй|сделай|сгенери|сгенерируй)\s+мне\b',
+        r'\b(сделай|сгенери|сгенерируй|нарисуй)\s+(кот|собак|дракон|девушк|парн|город|пейзаж|портрет)',
+        r'\b(хочу|давай)\s+картинк',
+        r'\bкартинк\w*\s+(сделай|сгенери|нарисуй)',
+    ]
+    for pat in image_patterns:
+        try:
+            if re.search(pat, low):
+                # Простая чистка без сложной regex
+                q = low
+                for word in ['сделай', 'сгенерируй', 'сгенери', 'нарисуй', 'создай', 'сваргань', 
+                             'замути', 'мне', 'картинку', 'картинка', 'изображение', 'фотку', 'пикчу', 'арт']:
+                    q = q.replace(word, '')
+                q = re.sub(r'\s+', ' ', q).strip()
+                return {"intent": "image", "query": q or "что-нибудь интересное"}
+        except Exception as e:
+            print(f"⚠ regex img: {e}"); continue
 
-    if re.search(r'\b(нарисуй|сгенери|сделай|покажи)\s+(меня|тебя|себя|свою\s+ав|свой\s+портрет)', low):
-        return {"intent": "image", "query": "автопортрет"}
+    # АВТОПОРТРЕТ
+    try:
+        if re.search(r'\b(нарисуй|сгенери|сгенерируй|сделай|покажи)\s+(меня|тебя|себя)\b', low):
+            return {"intent": "image", "query": "автопортрет"}
+    except: pass
 
+    # VISION
     if has_image:
-        for pat in [r'\b(посмотри|глянь|смотри|что\s+(тут|здесь|на|видишь))',
-                    r'\b(опиши|расскажи)\s+(что|про)', r'\b(что|кто|где)\s+это',
-                    r'^(че|чё|что)\s+(тут|здесь|видишь)']:
-            if re.search(pat, low): return {"intent": "vision", "query": low}
+        vision_patterns = [
+            r'\b(посмотри|глянь|смотри)\b',
+            r'\bчто\s+(тут|здесь|на|видишь)',
+            r'\b(опиши|расскажи)\s+(что|про)',
+            r'\bчто\s+это\b',
+            r'\bкто\s+это\b',
+        ]
+        for pat in vision_patterns:
+            try:
+                if re.search(pat, low): return {"intent": "vision", "query": low}
+            except: continue
         if len(low) < 30: return {"intent": "vision", "query": low or "опиши"}
 
-    for pat in [r'\b(найди|поищи|скачай|загрузи)\s+.*\b(видео|клип|трек|песн|муз)',
-                r'\b(видео|клип)\s+(про|с)', r'\bкинь\s+видос']:
-        if re.search(pat, low):
-            q = re.sub(r'\b(найди|поищи|скачай|загрузи|кинь|мне|видео|клип|видос)\b', '', low).strip()
-            return {"intent": "yt_search", "query": q or "что-нибудь"}
+    # YT search
+    yt_patterns = [
+        r'\b(найди|поищи|скачай|загрузи)\s+.{0,30}\b(видео|клип|трек|песн|муз)',
+        r'\b(видео|клип)\s+про\b',
+        r'\bкинь\s+видос',
+    ]
+    for pat in yt_patterns:
+        try:
+            if re.search(pat, low):
+                q = low
+                for word in ['найди', 'поищи', 'скачай', 'загрузи', 'кинь', 'мне', 'видео', 'клип', 'видос']:
+                    q = q.replace(word, '')
+                q = re.sub(r'\s+', ' ', q).strip()
+                return {"intent": "yt_search", "query": q or "что-нибудь"}
+        except: continue
 
-    if re.search(r'https?://(www\.)?(youtu\.be|youtube\.com)/', low):
+    # YT download
+    if 'youtu.be' in low or 'youtube.com' in low:
         m = re.search(r'https?://[^\s]+', text)
         if m: return {"intent": "yt_download", "query": m.group(0)}
 
-    if re.search(r'\b(проверь|глянь|оцени|проанализируй|ревью)\s+.*\bкод', low) or '```' in text:
-        return {"intent": "code_analyze", "query": ""}
+    # CODE
+    try:
+        if re.search(r'\b(проверь|глянь|оцени|проанализируй|ревью)\s+.{0,20}\bкод', low) or '```' in text:
+            return {"intent": "code_analyze", "query": ""}
+    except: pass
 
     return None
 
@@ -567,42 +616,22 @@ def sys_prompt(chat, creator=False, friend=False):
 # ══════════════════════════════════════════════════════════════════════════════
 # FMT + ANTI-CRINGE
 # ══════════════════════════════════════════════════════════════════════════════
+
 CRINGE_PATTERNS = [r'\bха[-\s]?ха\b.*\bзабавн', r'\bвау\b.*\bкруто\b',
     r'\bпросто\s+(топ|имба|супер|огонь)', r'\bреально\s+(круто|топ|имба|забавно)',
     r'\bдружище\b', r'\bтоварищ\b', r'\bприветствую\b',
     r'\bчем\s+(могу|я могу)\s+(помочь|быть полезен)', r'\bхочешь\s+я\s+', r'\bбуду\s+рад\s+помочь']
-CRINGE_WORDS = ['ору', 'жиза', 'база', 'имба', 'кринж', 'жесть', 'рил', 'пон', 'пиздец', 'нихуя']
 
+
+CRINGE_WORDS_LIST = ['ору', 'жиза', 'база', 'имба', 'кринж', 'жесть', 'треш', 'рил', 'пон', 'пиздец']
 def detect_cringe(text):
     if not text or len(text) < 5: return False
     low = text.lower()
     if any(re.search(p, low) for p in CRINGE_PATTERNS): return True
-    if sum(1 for w in CRINGE_WORDS if w in low) >= 3: return True
+    if sum(1 for w in CRINGE_WORDS_LIST if w in low) >= 3: return True
     if re.search(r'[😂🔥💯✨🤣💀😄]{3,}', text): return True
     if text.count('!') >= 4: return True
     return False
-
-def clean_cringe(text):
-    if not text: return text
-    # Цепочки сленга → оставляем первое слово
-    cringe_words = ['ору', 'жиза', 'база', 'имба', 'кринж', 'жесть', 'треш', 'рил', 'пон', 'пиздец']
-    # Ищем 2+ кринж-слов подряд через пробел/запятую
-    cringe_alt = '|'.join(cringe_words)
-    pattern = r'\b(?:(?:' + cringe_alt + r')\b[\s,]+){2,}(?:' + cringe_alt + r')?\b?'
-    def replace_chain(m):
-        found = re.findall(r'\b(?:' + cringe_alt + r')\b', m.group(0), flags=re.I)
-        return found[0] if found else ""
-    text = re.sub(pattern, replace_chain, text, flags=re.I)
-    # Зацикленные смайлы
-    text = re.sub(r'([😂🔥💯✨🤣💀😄])\1{2,}', r'\1', text)
-    # Кринж-фразы
-    for p in [r'^(ну)?\s*здравствуй(те)?[,!.\s]+', r'^привет\s+дружище[,!.\s]+',
-              r'^добрый день[,!.\s]+', r'^приветствую[,!.\s]+',
-              r'чем (могу |я могу )?(быть полезен|помочь)\??',
-              r'хочешь (чтобы )?я (тебе )?помог\??',
-              r'если (тебе )?нужна помощь', r'буду рад помочь']:
-        text = re.sub(p, '', text, flags=re.I)
-    return re.sub(r'\s+', ' ', text).strip()
 
 def fmt(text):
     parts = re.split(r'(```[\s\S]*?```|`[^`]+`)', text)
@@ -615,7 +644,66 @@ def fmt(text):
             clean = re.sub(r'\s+', ' ', clean)
             out.append(clean_cringe(clean))
     return "".join(out).strip()
+    
 
+
+
+
+def clean_cringe(text):
+    if not text: return text
+    
+    # Находим последовательности из 2+ кринж-слов подряд
+    # Простой проход без сложных regex
+    words = text.split()
+    if len(words) > 1:
+        result = []
+        skip_until = -1
+        for i, w in enumerate(words):
+            if i < skip_until:
+                continue
+            # Проверяем не начинается ли цепочка кринж-слов
+            wc = w.lower().strip(',.!?;:')
+            if wc in CRINGE_WORDS_LIST:
+                # Считаем сколько кринжа идёт подряд
+                j = i
+                while j < len(words):
+                    next_w = words[j].lower().strip(',.!?;:')
+                    if next_w not in CRINGE_WORDS_LIST:
+                        break
+                    j += 1
+                # Если 2+ кринжа подряд — оставляем только первое
+                if j - i >= 2:
+                    result.append(words[i])
+                    skip_until = j
+                else:
+                    result.append(w)
+            else:
+                result.append(w)
+        text = ' '.join(result)
+    
+    # Зацикленные смайлы (простой regex)
+    text = re.sub(r'([😂🔥💯✨🤣💀😄])\1{2,}', r'\1', text)
+    
+    # Кринж-фразы (по одной, без сложных конструкций)
+    cringe_phrases = [
+        r'^(ну\s+)?здравствуй(те)?[,!.\s]+',
+        r'^привет\s+дружище[,!.\s]+',
+        r'^добрый\s+день[,!.\s]+',
+        r'^приветствую[,!.\s]+',
+        r'чем\s+(могу|я\s+могу)\s+(быть\s+полезен|помочь)\??',
+        r'хочешь\s+(чтобы\s+)?я\s+(тебе\s+)?помог\??',
+        r'если\s+(тебе\s+)?нужна\s+помощь',
+        r'буду\s+рад\s+помочь',
+    ]
+    for p in cringe_phrases:
+        try:
+            text = re.sub(p, '', text, flags=re.I)
+        except Exception as e:
+            print(f"⚠ regex skip: {e}")
+            continue
+    
+    return re.sub(r'\s+', ' ', text).strip()
+    
 def is_self_req(p):
     return any(t in p.lower() for t in ["себя","тебя","ориен","orien","ава","аватар","автопортрет","меня"])
 
