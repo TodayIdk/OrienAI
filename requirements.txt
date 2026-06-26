@@ -1,7 +1,6 @@
 fastapi
 uvicorn
-httpx[http2]
-yt-dlp
+httpx
 motor
-pymongo
 Pillow
+python-multipart 
