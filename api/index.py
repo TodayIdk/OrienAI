@@ -1,4 +1,5 @@
 import os, re, asyncio, random, base64, urllib.parse
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import FastAPI, Request
@@ -6,6 +7,9 @@ from typing import Optional, Dict, Any
 from dataclasses import dataclass
 from enum import Enum
 import httpx
+
+# Добавляем папку api/ в путь импорта
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from motor.motor_asyncio import AsyncIOMotorClient
 
