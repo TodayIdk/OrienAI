@@ -41,7 +41,7 @@ async def init_db(db):
           f"{sum(len(c) for c in CHAT_MEMBERS.values())} members")
 
 async def save_wallet(cid: int, uid: int):
-    if not DB: return
+    if DB is None: return
     w = WALLETS.get(cid, {}).get(uid)
     if not w: return
     try:
@@ -54,7 +54,7 @@ async def save_wallet(cid: int, uid: int):
         print(f"❌ save_wallet: {e}")
 
 async def save_marriages(cid: int):
-    if not DB: return
+    if DB is None: return
     try:
         await DB.marriages.delete_many({"chat_id": cid})
         for m in MARRIAGES.get(cid, []):
@@ -63,7 +63,7 @@ async def save_marriages(cid: int):
         print(f"❌ save_marriages: {e}")
 
 async def save_members(cid: int):
-    if not DB: return
+    if DB is None: return
     try:
         await DB.members.update_one(
             {"chat_id": cid},
