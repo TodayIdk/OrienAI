@@ -8,34 +8,27 @@ WALLETS: Dict[int, Dict[int, Dict[str, Any]]] = {}
 MARRIAGES: Dict[int, List[Dict[str, Any]]] = {}
 PROPOSALS: Dict[tuple, Dict[str, Any]] = {}
 CHAT_MEMBERS: Dict[int, Dict[str, Dict[str, Any]]] = {}
+# Для функции "поговорить по душам" — ждём след. сообщение от юзера в ЛС
+HEART_PENDING: Dict[int, Dict[str, Any]] = {}  # uid -> {cid, spouse_id, spouse_name, ts}
 
-DB = None  # сюда положим motor клиент
+DB = None
 
 async def init_db(db):
-    """Загружает данные из MongoDB в кэш при старте"""
     global DB
     DB = db
-    
-    # Кошельки
     async for doc in db.wallets.find():
-        cid = doc["chat_id"]
-        uid = doc["user_id"]
+        cid = doc["chat_id"]; uid = doc["user_id"]
         if cid not in WALLETS: WALLETS[cid] = {}
         WALLETS[cid][uid] = {k: v for k, v in doc.items() if k not in ("_id", "chat_id", "user_id")}
-    
-    # Браки
     async for doc in db.marriages.find():
         cid = doc["chat_id"]
         if cid not in MARRIAGES: MARRIAGES[cid] = []
         MARRIAGES[cid].append({k: v for k, v in doc.items() if k not in ("_id", "chat_id")})
-    
-    # Участники чатов
     async for doc in db.members.find():
         cid = doc["chat_id"]
         if cid not in CHAT_MEMBERS: CHAT_MEMBERS[cid] = {}
         for un, info in doc.get("members", {}).items():
             CHAT_MEMBERS[cid][un] = info
-    
     print(f"✅ DB loaded: {sum(len(w) for w in WALLETS.values())} wallets, "
           f"{sum(len(m) for m in MARRIAGES.values())} marriages, "
           f"{sum(len(c) for c in CHAT_MEMBERS.values())} members")
@@ -80,18 +73,32 @@ def get_wallet(cid: int, uid: int, uname: str = "") -> Dict[str, Any]:
     if cid not in WALLETS: WALLETS[cid] = {}
     if uid not in WALLETS[cid]:
         WALLETS[cid][uid] = {
-            "name": uname, "coins": 100, "diamonds": 0, "food": 5,
+            "name": uname or "чел", "coins": 100, "diamonds": 0, "food": 5,
             "last_farm": 0, "last_quest": 0, "last_daily": 0,
             "farm_streak": 0, "quests_done": 0
         }
     w = WALLETS[cid][uid]
     if uname: w["name"] = uname
+    # backfill
+    for k, v in {"coins":0,"diamonds":0,"food":0,"last_farm":0,"last_quest":0,
+                 "last_daily":0,"farm_streak":0,"quests_done":0}.items():
+        if k not in w: w[k] = v
     return w
 
 async def add_coins(cid: int, uid: int, amount: int, uname: str = ""):
     w = get_wallet(cid, uid, uname); w["coins"] += amount
     await save_wallet(cid, uid)
     return w["coins"]
+
+async def add_diamonds(cid: int, uid: int, amount: int, uname: str = ""):
+    w = get_wallet(cid, uid, uname); w["diamonds"] += amount
+    await save_wallet(cid, uid)
+    return w["diamonds"]
+
+async def add_food(cid: int, uid: int, amount: int, uname: str = ""):
+    w = get_wallet(cid, uid, uname); w["food"] += amount
+    await save_wallet(cid, uid)
+    return w["food"]
 
 async def spend_coins(cid: int, uid: int, amount: int) -> bool:
     w = get_wallet(cid, uid)
@@ -193,8 +200,8 @@ async def daily(cid: int, uid: int, uname: str = ""):
 
 async def dice_game(cid: int, uid: int, bet: int):
     w = get_wallet(cid, uid)
-    if w["coins"] < bet: return None, "не хватает монет"
     if bet < 10: return None, "минимальная ставка *10* 🪙"
+    if w["coins"] < bet: return None, "не хватает монет"
     w["coins"] -= bet
     player = random.randint(1, 6) + random.randint(1, 6)
     bot = random.randint(1, 6) + random.randint(1, 6)
@@ -223,21 +230,34 @@ def get_spouse_id(cid: int, uid: int) -> Optional[int]:
     if not m: return None
     return m["u2"] if m["u1"] == uid else m["u1"]
 
+def get_spouse_info(cid: int, uid: int):
+    """Возвращает (spouse_id, spouse_name) или (None, None)"""
+    m = is_married(cid, uid)
+    if not m: return None, None
+    if m["u1"] == uid:
+        return m["u2"], m["u2_name"]
+    return m["u1"], m["u1_name"]
+
 def propose(cid: int, from_uid: int, from_name: str, target_uid: int, target_name: str):
-    if from_uid == target_uid: return "сам с собой? шиза"
-    if is_married(cid, from_uid): return f"*{from_name}* ты уже в браке сначала разведись `/divorce`"
-    if is_married(cid, target_uid): return f"*{target_name}* уже в браке :("
+    if from_uid == target_uid: return ("сам с собой? шиза", None)
+    if is_married(cid, from_uid):
+        return (f"*{from_name}* ты уже в браке сначала разведись `/divorce`", None)
+    if is_married(cid, target_uid):
+        return (f"*{target_name}* уже в браке :(", None)
     key = (cid, target_uid)
     if key in PROPOSALS:
         old = PROPOSALS[key]
         if time.time() - old["ts"] < 300:
-            return f"*{target_name}* уже есть предложение от *{old['from_name']}* пусть сначала ответит"
+            return (f"*{target_name}* уже есть предложение от *{old['from_name']}* пусть сначала ответит", None)
     PROPOSALS[key] = {"from": from_uid, "from_name": from_name, "target_name": target_name, "ts": time.time()}
-    return (f"💍 *{from_name}* делает предложение *{target_name}*!\n\n"
-            f"*{target_name}*, ответь:\n"
-            f"`/yes` — согласиться 💕\n"
-            f"`/no` — отказать 💔\n\n"
-            f"_(предложение действует 5 минут)_")
+    text = (f"💍 *{from_name}* делает предложение *{target_name}*!\n\n"
+            f"_(предложение действует 5 минут)_\n"
+            f"можно ответить кнопкой ниже или командой `/yes` / `/no`")
+    kb = {"inline_keyboard": [[
+        {"text": "💕 согласиться", "callback_data": f"marry_yes:{from_uid}:{target_uid}"},
+        {"text": "💔 отказать", "callback_data": f"marry_no:{from_uid}:{target_uid}"},
+    ]]}
+    return (text, kb)
 
 async def accept_proposal(cid: int, uid: int, uname: str):
     key = (cid, uid)
@@ -344,6 +364,34 @@ async def surprise(cid: int, uid: int, uname: str):
     return f"✨ *СЮРПРИЗ* от *{uname}* для *{spouse_name}*!\n\n{text}\n\n💕 `+{love_gain}` любви → *{m['love']}/100*\n`-{cost}` 🪙"
 
 # ══════════════════════════════════════════════════════════════════════════════
+# ПОГОВОРИТЬ ПО ДУШАМ
+# ══════════════════════════════════════════════════════════════════════════════
+def start_heart2heart(uid: int, cid: int, spouse_id: int, spouse_name: str, anon: bool = False):
+    """Регистрирует ожидание сообщения от юзера в ЛС"""
+    HEART_PENDING[uid] = {
+        "cid": cid, "spouse_id": spouse_id, "spouse_name": spouse_name,
+        "ts": time.time(), "anon": anon
+    }
+
+def pop_heart2heart(uid: int):
+    """Достаёт и удаляет ожидание (если есть и не протухло)"""
+    p = HEART_PENDING.get(uid)
+    if not p: return None
+    if time.time() - p["ts"] > 600:  # 10 мин
+        del HEART_PENDING[uid]
+        return None
+    del HEART_PENDING[uid]
+    return p
+
+def has_heart_pending(uid: int) -> bool:
+    p = HEART_PENDING.get(uid)
+    if not p: return False
+    if time.time() - p["ts"] > 600:
+        del HEART_PENDING[uid]
+        return False
+    return True
+
+# ══════════════════════════════════════════════════════════════════════════════
 # ПОИСК ЮЗЕРОВ
 # ══════════════════════════════════════════════════════════════════════════════
 async def remember_member(cid: int, user: dict):
@@ -356,6 +404,14 @@ async def remember_member(cid: int, user: dict):
 def find_user_by_username(cid: int, username: str) -> Optional[Dict]:
     un = username.lstrip("@").lower()
     return CHAT_MEMBERS.get(cid, {}).get(un)
+
+def find_user_global(username: str):
+    """Ищет юзера во всех чатах (для /grant из ЛС)"""
+    un = username.lstrip("@").lower()
+    for cid, members in CHAT_MEMBERS.items():
+        if un in members:
+            return cid, members[un]
+    return None, None
 
 def extract_target(text: str, reply: Optional[dict], cid: int):
     if reply:
