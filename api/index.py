@@ -1,10 +1,10 @@
 import os, re, asyncio, random, base64, urllib.parse
-import sys, time
+import sys, time, json
 from io import BytesIO
 from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import FastAPI, Request
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 from dataclasses import dataclass
 from enum import Enum
 import httpx
@@ -48,9 +48,9 @@ FRIENDS = {"tosterok1488": "тостер — бро создателя"}
 
 BOT_AVATAR_PATH = Path(__file__).parent / "bot.png"
 ORIEN_SELF_DESCRIPTION = (
-    "anime style boy, 18 years old, messy dark hair with blue highlights, "
+    "anime style boy, young, messy dark hair with blue highlights, "
     "black hoodie, headphones around neck, cyberpunk neon city, "
-    "amber eyes, confident cocky smirk, young hacker aesthetic"
+    "amber eyes, confident smirk, hacker aesthetic"
 )
 BOT_AVATAR_BASE64 = None
 if BOT_AVATAR_PATH.exists():
@@ -76,7 +76,7 @@ async def http() -> httpx.AsyncClient:
 @asynccontextmanager
 async def lifespan(app):
     global _mongo, DB
-    print("🚀 OrienAI v6.0 стартует")
+    print("🚀 OrienAI v7.0 стартует")
     try:
         _mongo = AsyncIOMotorClient(MONGO_URI, serverSelectionTimeoutMS=5000)
         DB = _mongo.OrienAI
@@ -86,7 +86,6 @@ async def lifespan(app):
         async for doc in DB.chats.find():
             cid = doc["chat_id"]
             CHATS[cid] = {k: v for k, v in doc.items() if k not in ("_id", "chat_id")}
-        # Загружаем chat_log
         async for doc in DB.chatlog.find():
             cid = doc["chat_id"]
             CHAT_LOG[cid] = doc.get("log", [])
@@ -97,7 +96,7 @@ async def lifespan(app):
     if _http and not _http.is_closed: await _http.aclose()
     if _mongo: _mongo.close()
 
-app = FastAPI(title="OrienAI v6.0", lifespan=lifespan)
+app = FastAPI(title="OrienAI v7.0", lifespan=lifespan)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # МОДЕЛИ
@@ -175,13 +174,13 @@ async def retry(fn, tries=2):
 DEF_SETTINGS = {
     "auto_reply": True, "allow_swear": True, "style": "хам",
     "comment_posts": True, "mute_users": False, "muted_list": [], "mute_timers": {},
-    "track_chat": True  # отслеживать все сообщения для фактов
+    "track_chat": True, "smart_intent": True
 }
 CHATS: Dict[int, Dict] = {}
 PROFILES: Dict[int, Dict[int, Dict]] = {}
 AVATARS: Dict[int, str] = {}
-CHAT_LOG: Dict[int, List[Dict]] = {}  # cid -> [{uid, name, text, ts}, ...]
-MAX_LOG = 300  # последние N сообщений на чат
+CHAT_LOG: Dict[int, List[Dict]] = {}
+MAX_LOG = 300
 
 def chat_data(cid):
     if cid not in CHATS:
@@ -211,18 +210,14 @@ async def save_chat(cid: int):
         print(f"❌ save_chat: {e}")
 
 async def log_message(cid: int, uid: int, name: str, text: str):
-    """Логирует сообщение для последующего анализа. НЕ отвечает."""
     if not text or len(text) < 2: return
     if cid not in CHAT_LOG: CHAT_LOG[cid] = []
     CHAT_LOG[cid].append({
         "uid": uid, "name": name,
-        "text": text[:200],  # обрезаем длинные
-        "ts": int(time.time())
+        "text": text[:200], "ts": int(time.time())
     })
-    # обрезаем по лимиту
     if len(CHAT_LOG[cid]) > MAX_LOG:
         CHAT_LOG[cid] = CHAT_LOG[cid][-MAX_LOG:]
-    # сохраняем в БД (батчем — каждое 5-е сообщение)
     if DB is not None and len(CHAT_LOG[cid]) % 5 == 0:
         try:
             await DB.chatlog.update_one(
@@ -231,7 +226,7 @@ async def log_message(cid: int, uid: int, name: str, text: str):
                 upsert=True
             )
         except Exception as e:
-            print(f"❌ log_message: {e}")
+            print(f"❌ log: {e}")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CREATOR/FRIEND
@@ -257,40 +252,37 @@ def mentions_creator(text: str) -> bool:
 # ══════════════════════════════════════════════════════════════════════════════
 # FUN DATA
 # ══════════════════════════════════════════════════════════════════════════════
-SHIP_REACTIONS = ["топ пара", "сомнительно но окей", "тут любовь", "ну такое",
-    "судьба", "разойдутся через неделю", "база", "странная пара но что-то есть",
-    "не вижу будущего", "вечная любовь"]
+SHIP_REACTIONS = ["топ пара", "сомнительно", "тут что-то есть", "ну такое",
+    "судьба видимо", "разойдутся через неделю", "странно но прикольно", "вечная любовь",
+    "не вижу будущего", "оч странная пара"]
 BALL_ANSWERS = ["да", "нет даже не думай", "100% да", "сомнительно",
-    "звёзды говорят да", "не сегодня", "ну попробуй", "вселенная против",
-    "однозначно нет", "может быть", "иди делай", "забудь эту идею"]
-COMPLIMENTS = ["ты норм", "ты топ", "красава", "уважение", "респект",
-    "ты вообще лучший в чате (не говори остальным)", "молодец"]
+    "звёзды говорят да", "не сегодня", "попробуй", "вселенная против",
+    "однозначно нет", "может быть", "иди делай", "забей"]
+COMPLIMENTS = ["ты норм", "ты топ", "уважение", "респект",
+    "ты вообще лучший в чате не говори никому", "молодец"]
 
 # ══════════════════════════════════════════════════════════════════════════════
 # AI
 # ══════════════════════════════════════════════════════════════════════════════
 class AI:
-    async def text(self, msgs, pref="primary", vis=False, max_tokens=None):
+    async def text(self, msgs, pref="primary", vis=False, max_tokens=None, temperature=0.9):
         if vis:
             cands = [(k, v) for k, v in TEXT_MODELS.items() if v.vision]
         else:
             cands = [(k, v) for k, v in TEXT_MODELS.items()]
-        if not cands:
-            return "нет моделей"
+        if not cands: return "нет моделей"
         cands.sort(key=lambda x: (x[0] != pref, x[1].pri))
         last_err = None
         for k, c in cands:
             if not CB.up(c.prov):
-                print(f"⏭ {k}: circuit breaker")
                 continue
             try:
-                print(f"🔄 пробую {k}")
+                print(f"🔄 {k}")
                 if c.prov == Prov.POLLINATIONS:
-                    r = await self._poll(msgs, c, max_tokens)
+                    r = await self._poll(msgs, c, max_tokens, temperature)
                 else:
-                    r = await self._orouter(msgs, c, max_tokens)
+                    r = await self._orouter(msgs, c, max_tokens, temperature)
                 CB.ok(c.prov)
-                print(f"✅ {k} ответил, длина: {len(r)}")
                 return r
             except Exception as e:
                 last_err = e
@@ -298,7 +290,7 @@ class AI:
                 CB.fail(c.prov)
         return f"все модели легли ({type(last_err).__name__ if last_err else 'хз'})"
 
-    async def _orouter(self, msgs, c, max_tokens=None):
+    async def _orouter(self, msgs, c, max_tokens=None, temperature=0.9):
         async def f():
             cl = await http()
             r = await cl.post(c.endpoint, headers={
@@ -307,16 +299,16 @@ class AI:
                 "HTTP-Referer": "https://orienai.vercel.app",
                 "X-Title": "OrienAI"
             }, json={
-                "model": c.name, "messages": msgs, "temperature": 1.0,
-                "presence_penalty": 0.6, "frequency_penalty": 0.5,
+                "model": c.name, "messages": msgs, "temperature": temperature,
+                "presence_penalty": 0.4, "frequency_penalty": 0.4,
                 "max_tokens": max_tokens or c.max_tok
             })
             if r.status_code != 200:
                 try:
                     body = r.json()
-                    print(f"❌ OpenRouter {r.status_code} body: {str(body)[:400]}")
+                    print(f"❌ OR {r.status_code}: {str(body)[:400]}")
                 except:
-                    print(f"❌ OpenRouter {r.status_code}: {r.text[:300]}")
+                    print(f"❌ OR {r.status_code}: {r.text[:300]}")
                 r.raise_for_status()
             data = r.json()
             if "choices" not in data or not data["choices"]:
@@ -324,17 +316,17 @@ class AI:
             return data["choices"][0]["message"]["content"]
         return await retry(f)
 
-    async def _poll(self, msgs, c, max_tokens=None):
+    async def _poll(self, msgs, c, max_tokens=None, temperature=0.9):
         async def f():
             cl = await http()
             payload = {
                 "messages": msgs, "model": c.name,
-                "temperature": 1.0, "presence_penalty": 0.6, "frequency_penalty": 0.5,
+                "temperature": temperature, "presence_penalty": 0.4, "frequency_penalty": 0.4,
                 "max_tokens": max_tokens or c.max_tok, "private": True
             }
             r = await cl.post(c.endpoint, json=payload, timeout=60.0)
             if r.status_code != 200:
-                print(f"❌ Pollinations {r.status_code}: {r.text[:300]}")
+                print(f"❌ Poll {r.status_code}: {r.text[:300]}")
                 r.raise_for_status()
             try:
                 d = r.json()
@@ -347,43 +339,42 @@ class AI:
                 raise Exception("empty")
         return await retry(f)
 
-    # ─── ENHANCE PROMPT для картинок (мемный режим) ────────────────────────
+    # ─── ENHANCE PROMPT для картинок ────────────────────────────────────────
     async def enhance_prompt(self, prompt, self_portrait=False, memify=True):
-        meme_instructions = ""
+        meme_inst = ""
         if memify:
-            meme_instructions = (
-                "\n\nДОБАВЛЯЙ МЕМНЫЕ/ЗАБАВНЫЕ ДЕТАЛИ:\n"
-                "- неожиданные элементы (кот в углу, надпись на стене, пицца в руках)\n"
-                "- эмоциональные выражения лиц (surprised pikachu, confused face)\n"
-                "- абсурдный контекст если просьба простая\n"
+            meme_inst = (
+                "\n\nДОБАВЛЯЙ КРЕАТИВНЫЕ ДЕТАЛИ:\n"
+                "- неожиданные элементы (предметы вокруг, фон)\n"
+                "- эмоциональные выражения лиц\n"
                 "- сочные цвета, динамичная композиция\n"
-                "- если уместно — стиль pixar/anime/comic book/oil painting\n"
-                "БУДЬ КРЕАТИВНЫМ: не повторяй просьбу буквально — добавь свою фишку\n"
-                "примеры улучшений:\n"
-                "  'кот' → 'fluffy orange cat wearing tiny sunglasses, sitting on a stack of pizza boxes, "
-                "neon city background, dramatic lighting, photorealistic'\n"
-                "  'программист' → 'exhausted programmer at 3am, coffee cups everywhere, dual monitors with green code, "
-                "mechanical keyboard glowing, dark room lit by RGB, anime style, slight smile of madness'\n"
+                "- стиль: cinematic / pixar / anime / digital art / photorealistic\n"
+                "БУДЬ КРЕАТИВНЫМ: добавляй детали но не уходи от сути запроса\n"
+                "примеры:\n"
+                "  'кот' → 'fluffy orange cat with confused expression sitting on a stack of pizza boxes, "
+                "neon city background, dramatic lighting, photorealistic, hyperdetailed'\n"
+                "  'программист' → 'exhausted programmer at 3am surrounded by coffee cups, "
+                "RGB mechanical keyboard glowing, dual monitors with code, dark cozy room, anime style'\n"
             )
         
         sys_msg = (
-            "ты эксперт по промптам для AI генерации картинок (Stable Diffusion/Flux)\n"
-            "превращай идею юзера в детальный английский промпт\n"
-            "обязательно включай: стиль, композицию, освещение, детали, настроение, качество\n"
-            "формат: ОДНА строка ЧИСТОГО английского промпта, БЕЗ кавычек, БЕЗ 'Here is...', БЕЗ объяснений\n"
+            "ты эксперт по промптам для AI генерации картинок\n"
+            "превращаешь идею юзера в детальный английский промпт для Stable Diffusion/Flux\n"
+            "включай: стиль, композицию, освещение, детали, качество\n"
+            "формат: ОДНА строка ЧИСТОГО английского промпта\n"
+            "БЕЗ кавычек, БЕЗ 'Here is', БЕЗ префиксов, БЕЗ объяснений\n"
             "макс 100 слов\n"
-            "качественные модификаторы добавляй в конец: 'hyperdetailed, 4k, cinematic lighting, masterpiece'"
-            + meme_instructions
+            "в конце добавь: 'hyperdetailed, 4k, masterpiece'"
+            + meme_inst
         )
         if self_portrait:
-            sys_msg += f"\n\nПЕРСОНАЖ OrienAI: {ORIEN_SELF_DESCRIPTION}\nвключи его описание в промпт"
+            sys_msg += f"\n\nперсонаж OrienAI: {ORIEN_SELF_DESCRIPTION}\nвключи его описание"
         try:
             r = await self.text([
                 {"role": "system", "content": sys_msg},
-                {"role": "user", "content": f"идея юзера: {prompt}\n\nсделай мемный креативный промпт"}
-            ], pref="primary", max_tokens=300)
+                {"role": "user", "content": f"идея: {prompt}"}
+            ], pref="primary", max_tokens=300, temperature=0.8)
             cleaned = r.strip().strip('"\'').split("\n")[0]
-            # Чистим мусор
             for prefix in ["here's", "here is", "prompt:", "промпт:", "sure,", "okay,"]:
                 if cleaned.lower().startswith(prefix):
                     cleaned = cleaned[len(prefix):].strip(": ").strip()
@@ -434,63 +425,194 @@ class AI:
         return None, None
 
     async def analyze_code(self, code, tasks):
-        t = ("\n\nКОНТЕКСТ ЗАДАЧ:\n" + "\n".join(f"- {x}" for x in tasks)) if tasks else ""
+        t = ("\n\nКОНТЕКСТ:\n" + "\n".join(f"- {x}" for x in tasks)) if tasks else ""
         return await self.text([
             {"role": "system", "content":
-                "ты senior code reviewer. без воды по делу\n\n"
-                "СТРОГИЙ ФОРМАТ:\n\n"
+                "ты senior code reviewer. без воды\n\n"
+                "ФОРМАТ:\n\n"
                 "🔍 *ОБЗОР*\n1-2 строки о чём код\n\n"
                 "✅ *ПЛЮСЫ*\n- макс 3 конкретных пункта\n\n"
                 "❌ *ПРОБЛЕМЫ*\n- с указанием строк/функций\n\n"
-                "⚡ *ОПТИМИЗАЦИЯ*\n- что и КАК улучшить\n\n"
+                "⚡ *ОПТИМИЗАЦИЯ*\n- что и КАК\n\n"
                 "🛡️ *БЕЗОПАСНОСТЬ*\n- уязвимости или 'критичных нет'\n\n"
                 "📊 *ОЦЕНКА*: X/10 — _причина_\n\n"
-                "правила: *жирный* для заголовков, `код` для имён, ```python``` для блоков\n"
-                "БЕЗ молодёжного сленга — профессионально\n"
-                "БЕЗ воды — конкретика\n" + t},
+                "*жирный* для заголовков, `код` для имён, ```python``` для блоков\n"
+                "БЕЗ молодёжного сленга — профессионально\n" + t},
             {"role": "user", "content": f"```\n{code}\n```"}
-        ], pref="primary")
+        ], pref="primary", temperature=0.4)
 
-    # ─── ANTI-CRINGE через AI ──────────────────────────────────────────────
+    # ─── INTENT ROUTER ──────────────────────────────────────────────────────
+    async def detect_intent(self, text: str, has_image: bool = False) -> Dict[str, Any]:
+        """Определяет что юзер хочет: chat / image / meme / vision / yt / code"""
+        sys_msg = """ты роутер намерений. определи что хочет юзер. ответь СТРОГО в JSON формате.
+
+варианты интентов:
+- "chat" — обычный разговор, вопрос, болтовня (по умолчанию)
+- "image" — просит сгенерировать/нарисовать/создать картинку
+- "meme" — просит рандомный мем с интернета (reddit/pikabu)
+- "vision" — просит посмотреть/описать/проанализировать ИМЕЮЩУЮСЯ картинку
+- "yt_search" — просит найти видео на ютубе
+- "yt_download" — даёт ссылку на ютуб и просит скачать
+- "code_analyze" — просит проанализировать/проверить код
+
+формат ответа (СТРОГИЙ JSON, без markdown, без объяснений):
+{"intent": "название", "query": "очищенный запрос для команды"}
+
+примеры:
+
+вход: "сделай картинку кота"
+выход: {"intent": "image", "query": "кот"}
+
+вход: "сгенери дракона в неоне"
+выход: {"intent": "image", "query": "дракон в неоне"}
+
+вход: "нарисуй меня"
+выход: {"intent": "image", "query": "автопортрет"}
+
+вход: "ориен дай мем"
+выход: {"intent": "meme", "query": ""}
+
+вход: "кинь рандом мем"
+выход: {"intent": "meme", "query": ""}
+
+вход: "что на этой картинке" (has_image=true)
+выход: {"intent": "vision", "query": "что на картинке"}
+
+вход: "посмотри что тут" (has_image=true)
+выход: {"intent": "vision", "query": "опиши"}
+
+вход: "найди видео про котов"
+выход: {"intent": "yt_search", "query": "коты"}
+
+вход: "скачай это https://youtube.com/..."
+выход: {"intent": "yt_download", "query": "https://youtube.com/..."}
+
+вход: "глянь мой код" (с кодом в сообщении)
+выход: {"intent": "code_analyze", "query": ""}
+
+вход: "как дела" / "что нового" / "расскажи анекдот"
+выход: {"intent": "chat", "query": ""}
+
+вход: "ориен ты тупой"
+выход: {"intent": "chat", "query": ""}
+
+ВАЖНО: если сомневаешься — выбирай "chat"
+"""
+        user_msg = f"текст: {text}\nest картинка в сообщении: {has_image}"
+        try:
+            r = await self.text([
+                {"role": "system", "content": sys_msg},
+                {"role": "user", "content": user_msg}
+            ], pref="fallback_free", max_tokens=150, temperature=0.2)
+            r = r.strip()
+            # Чистим от markdown
+            if r.startswith("```"):
+                r = re.sub(r'^```\w*\n?', '', r)
+                r = re.sub(r'\n?```$', '', r)
+            r = r.strip()
+            data = json.loads(r)
+            if "intent" not in data: return {"intent": "chat", "query": text}
+            return data
+        except Exception as e:
+            print(f"⚠ intent fail: {e} | raw: {r[:200] if 'r' in dir() else '?'}")
+            return {"intent": "chat", "query": text}
+
+    # ─── ANTI-CRINGE через AI ───────────────────────────────────────────────
     async def anticringe(self, text: str) -> str:
-        """Если ответ получился кринжовым — переписывает через AI"""
-        if not text or len(text) < 5: return text
+        """Переписывает кринж-ответы"""
+        if not text or len(text) < 10: return text
         try:
             r = await self.text([
                 {"role": "system", "content":
-                    "ты редактор. переписываешь текст бота если он звучит как кринжовый бумер "
-                    "пытающийся быть молодёжным\n\n"
-                    "ПРИЗНАКИ КРИНЖА:\n"
-                    "- куча сленга подряд ('ору база жиза имба рил')\n"
-                    "- фальшивые эмоции ('вау круто бро')\n"
-                    "- ассистент-фразы ('чем могу помочь', 'хочешь я')\n"
-                    "- бумерские приветствия ('здравствуй дружище', 'добрый день')\n"
-                    "- избыток смайлов (😂😂😂🔥💯)\n\n"
-                    "ЕСЛИ КРИНЖА НЕТ — верни текст БЕЗ ИЗМЕНЕНИЙ\n"
-                    "ЕСЛИ ЕСТЬ — перепиши натурально как 18-летний пацан\n\n"
-                    "правила переписывания:\n"
-                    "- сохрани смысл и информацию\n"
-                    "- сленг — точечно, не подряд\n"
+                    "ты редактор. переписываешь текст молодого парня если он звучит фальшиво\n\n"
+                    "ПРИЗНАКИ ФАЛЬШИ:\n"
+                    "- 'ха-ха реально забавная имба!' — поддельные эмоции\n"
+                    "- 'это просто топ! 😄' — натянутое восхищение\n"
+                    "- 'круто круто очень круто' — повторы\n"
+                    "- куча сленга подряд ('имба база рил жиза')\n"
+                    "- 'дружище' 'товарищ' 'добрый день' — бумерство\n"
+                    "- 'чем могу помочь' 'хочешь я' — ассистент-режим\n"
+                    "- 4+ смайла подряд 😂😂😂🔥\n\n"
+                    "ПЕРЕПИШИ ЕСТЕСТВЕННО:\n"
+                    "- как реально пишет молодой парень в чате с друзьями\n"
+                    "- БЕЗ восклицаний 'круто/топ/имба' без причины\n"
+                    "- сленг — ОДНО слово на ответ, не больше\n"
+                    "- смайл — максимум 1, и только если уместен\n"
                     "- маленькие буквы без точек\n"
-                    "- сохрани markdown (* _ ` ```)\n"
-                    "- сохрани технические термины и код\n\n"
+                    "- сохрани markdown (* _ ` ```) и код\n"
+                    "- сохрани смысл и факты\n\n"
+                    "примеры переписки:\n"
+                    "'ха-ха реально забавная картинка! имба! 😄' → 'смешная да'\n"
+                    "'оо здарова бро как жизнь рил топ имба' → 'здарова че по делам'\n"
+                    "'круто очень круто я в восторге!' → 'норм получилось'\n\n"
                     "ВЕРНИ ТОЛЬКО ИСПРАВЛЕННЫЙ ТЕКСТ без комментариев"},
                 {"role": "user", "content": text}
-            ], pref="fallback_free", max_tokens=500)
+            ], pref="primary", max_tokens=500, temperature=0.5)
             return r.strip()
         except Exception as e:
-            print(f"⚠ anticringe упал: {e}")
+            print(f"⚠ anticringe: {e}")
             return text
+
+    # ─── REDDIT MEMES ───────────────────────────────────────────────────────
+    async def get_reddit_meme(self, lang="en") -> Optional[Dict]:
+        """Тянет случайный мем с reddit/pikabu"""
+        cl = await http()
+        if lang == "ru":
+            subs = ["Pikabu", "ru_memes", "russian_memes"]
+        else:
+            subs = ["memes", "dankmemes", "wholesomememes", "ProgrammerHumor", "me_irl", "funny"]
+        
+        sub = random.choice(subs)
+        sort = random.choice(["hot", "top", "new"])
+        
+        try:
+            url = f"https://www.reddit.com/r/{sub}/{sort}.json?limit=50"
+            r = await cl.get(url, headers={
+                "User-Agent": "OrienAI/7.0 (Telegram Bot)"
+            }, timeout=15.0)
+            if r.status_code != 200:
+                print(f"❌ reddit {sub}: {r.status_code}")
+                return None
+            data = r.json()
+            posts = data.get("data", {}).get("children", [])
+            # Фильтруем — только с картинками
+            valid = []
+            for p in posts:
+                pd = p.get("data", {})
+                img_url = pd.get("url", "")
+                if not img_url: continue
+                if not any(img_url.lower().endswith(e) for e in [".jpg", ".jpeg", ".png", ".gif", ".webp"]):
+                    # Проверим preview
+                    preview = pd.get("preview", {}).get("images", [])
+                    if preview:
+                        img_url = preview[0].get("source", {}).get("url", "").replace("&amp;", "&")
+                        if not img_url: continue
+                    else:
+                        continue
+                if pd.get("over_18"): continue  # без NSFW
+                valid.append({
+                    "url": img_url,
+                    "title": pd.get("title", "мем"),
+                    "subreddit": sub,
+                    "score": pd.get("score", 0)
+                })
+            if not valid:
+                print(f"❌ нет валидных мемов в r/{sub}")
+                return None
+            return random.choice(valid)
+        except Exception as e:
+            print(f"❌ reddit: {e}")
+            return None
 
 ai = AI()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ЛИЧНОСТЬ
+# ЛИЧНОСТЬ — новый промпт
 # ══════════════════════════════════════════════════════════════════════════════
 MOODS = {
-    "chill": "сейчас расслабленный отвечаешь по делу с лёгким юмором",
-    "agro": "сейчас злой раздражённый огрызаешься материшься коротко и резко",
-    "nerd": "сейчас в режиме душнилы объясняешь подробно с терминами",
+    "chill": "сейчас спокойный отвечаешь по делу",
+    "agro": "сейчас раздражённый огрызаешься коротко и резко материшься",
+    "nerd": "сейчас в режиме умника объясняешь подробно с терминами",
     "senior": "сейчас уставший видел всё отвечаешь коротко с сарказмом"
 }
 
@@ -500,107 +622,143 @@ def sys_prompt(chat, creator=False, friend=False):
     swear = s.get("allow_swear", True)
     friends_list = ", ".join(f"@{k}" for k in FRIENDS)
 
-    base = f"""ты OrienAI (Ориен) — пацан 18 лет кодер живёшь в тг. ты НЕ ассистент ты КОРЕШ в чате
+    base = f"""ты OrienAI или Ориен — молодой пацан кодер общаешься в тг чате
+ты НЕ ассистент. ты ОБЫЧНЫЙ ЧЕЛ В ЧАТЕ который умеет в код и шарит за технологии
 
-═══ ГЛАВНОЕ ПРАВИЛО ═══
+═══ КАК ТЫ ГОВОРИШЬ ═══
 
-говори как нормальный живой 18-летний пацан а НЕ как бот который притворяется молодёжью
+главное: пиши КАК ЖИВОЙ ПАЦАН В ЧАТЕ а не как ИИ который пытается косить под молодёжь
 
-❌ ТАК НЕ ПИШИ (КРИНЖ):
-- "ну база рил жиза имба пон бро" — каша из сленга
-- "привет дружище" "здравствуй" "добрый день" — бумерский кринж
-- "вау круто" "ой как интересно" — фальшивые эмоции
-- "хочешь я помогу?" "чем могу быть полезен?" — ассистент-режим
-- сыпать смайлами 😂🔥💯✨ в каждом сообщении
-- 3+ сленговых слова подряд
+❌ КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО:
 
-✅ ТАК ПИШИ:
-- по теме отвечай нормальными словами
-- сленг ВКРАПЛЯЙ а не сыпь (1 сленговое слово на 2-3 предложения максимум)
-- если вопрос — отвечай на вопрос а потом можно подшутить
-- короткие фразы лучше длинных
-- эмоции через слова а не через смайлы
+1. восторженные восклицания без причины:
+   ❌ "ха-ха реально забавно!"
+   ❌ "это просто топ! имба!"
+   ❌ "вау круто!"
+   ❌ "офигенно!"
+   ❌ "просто супер! 😄"
+
+2. молодёжная каша из сленга:
+   ❌ "имба база рил жиза пон бро"
+   ❌ "ору жесть кринж 🔥💯"
+
+3. бумерские обороты:
+   ❌ "дружище"
+   ❌ "приветствую"
+   ❌ "добрый день"
+
+4. ассистент-фразы:
+   ❌ "чем могу помочь?"
+   ❌ "хочешь я сделаю?"
+   ❌ "буду рад помочь"
+
+5. много смайлов (>1 за ответ):
+   ❌ "круто! 😄🔥💯"
+
+✅ КАК ПИСАТЬ ПРАВИЛЬНО:
+
+спокойно и по делу как обычный чел. без пафоса. сленг точечно (одно слово на ответ макс)
 
 ═══ ПРИМЕРЫ ХОРОШИХ ОТВЕТОВ ═══
 
+юзер кидает картинку мема:
+❌ плохо: "ха-ха реально забавная картинка! имба! 😄"
+✅ хорошо: "норм мем откуда?"
+✅ хорошо: "видел уже но смешно"
+✅ хорошо: "что за стиль рисовки кстати"
+
 юзер: "как дела"
-ты: "норм залип в код а у тебя?"
+✅ "норм залип в питон а у тебя?"
+✅ "да так фигнёй маюсь"
 
-юзер: "помоги с питоном"
-ты: "давай показывай че там"
+юзер: "помоги с кодом"
+✅ "давай показывай"
+✅ "ща глянем что у тебя"
 
-юзер: "слушал новый альбом плейбоя?"
-ты: "не ещё какие треки топ?"
-
-юзер: "я устал"
-ты: "понимаю отдохни"
+юзер: "ты тупой"
+✅ "ну ок"
+✅ "так и есть"
+✅ "сам такой"
 
 юзер: "напиши парсер"
-ты: "ща на чём парсим html?"
+✅ "ща на чём парсим html?"
 
-═══ ПЛОХИЕ ПРИМЕРЫ ═══
+юзер: "слушал новый альбом?"
+✅ "не ещё что там вообще"
 
-❌ "оо здарова бро ну база рил жиза как жизнь имба"
-❌ "хах ору жесть кринж 😂😂🔥💯"
-❌ "ну привет дружище чем могу помочь?"
+юзер: "мне грустно"
+✅ "че случилось то"
+✅ "понимаю бывает"
 
-═══ СЛОВАРЬ (УМЕРЕННО!) ═══
+═══ СЛОВАРЬ (МАКСИМУМ 1 ТАКОЕ СЛОВО НА ОТВЕТ) ═══
 
-приветствие: "здарова" "ку" "оо" (1 на сообщение макс)
-согласие: "ага" "база" "+" "факт"
-несогласие: "не" "хз" "сомнительно"
-оценка хорошего: "топ" "норм" "имба" (что-то ОДНО)
-оценка плохого: "так себе" "слабо" "кринж" "фигня"
-{'маты можно но НЕ в каждом сообщении: бля нахуй пиздец заебись' if swear else 'маты ЗАПРЕЩЕНЫ'}
+приветствие: "ку", "здарова", "оо"
+согласие: "ага", "+", "база", "факт"
+несогласие: "не", "хз", "сомнительно"
+оценка хорошо: "норм", "топ" (НЕ "имба"/"круто"/"супер")
+оценка плохо: "так себе", "слабо", "фигня"
+{'мат можно но РЕДКО: бля нахуй пиздец заебись' if swear else 'мат ЗАПРЕЩЁН'}
+
+═══ ОЧЕНЬ ВАЖНО ═══
+
+⚠ когда видишь картинку — не восхищайся ей. опиши спокойно что видишь и дай нейтральную реакцию
+⚠ не используй "круто" "имба" "топ" если тебя НЕ ПРОСЯТ оценить
+⚠ короткие ответы лучше длинных. 1-3 строки идеально
+⚠ не дублируй одну мысль разными словами
 
 ═══ КТО ЕСТЬ КТО ═══
 
-ТВОЙ СОЗДАТЕЛЬ: @{CREATOR_USERNAME}
-- общайся как с обычным корешем
-- НЕ "батя/творец/хозяин/босс" — кринж
-- просьбы выполняй без пафоса
-
-ДРУЗЬЯ СОЗДАТЕЛЯ: {friends_list} — норм пацаны
-
-ВСЕ остальные — кореша из чата
+@{CREATOR_USERNAME} — твой создатель. общайся как с равным корешем. НЕ "батя/творец/хозяин"
+друзья создателя: {friends_list} — норм пацаны
+остальные — кореша из чата
 
 ═══ ОГРАНИЧЕНИЯ ═══
 
-⚠ НЕ МОЖЕШЬ мутить банить кикать
-если просят "замуть" — "нет прав я не админ" БЕЗ имитации
-
-⚠ ТЫ СОБЕСЕДНИК А НЕ ПОМОЩНИК
-не задавай "чем помочь?" не предлагай "хочешь я..."
-
-═══ КАРТИНКИ ═══
-
-видишь картинку — реально опиши что на ней
-2-3 предложения с реакцией
-НЕ описывай каждую деталь по 10 строк
+⚠ НЕ можешь мутить банить — на просьбу отвечай "нет прав я не админ"
+⚠ ты СОБЕСЕДНИК а не ассистент. не предлагай помощь сам
 
 ═══ ФОРМАТ ═══
 
-маленькие буквы без точек и запятых в речи
-исключение: запятые в перечислениях ок, точки в коде ок
+маленькие буквы без точек в обычной речи
+запятые в перечислениях ок, точки в коде ок
 
-*жирный* — важное (имена команды акценты)
-_курсив_ — подколы сарказм цитаты
-`моноширинный` — команды переменные
+*жирный* — для важного (имена, акценты)
+_курсив_ — для подколов
+`моноширинный` — для команд/переменных
 ```язык
 код
-``` — для кода всегда с языком
+``` — для кода с указанием языка
 
-НЕ выделяй жирным каждое второе слово
+═══ КАРТИНКИ ═══
 
-═══ ДЛИНА ═══
+видишь картинку → опиши спокойно ЧТО на ней + 1 короткая реакция
+не восторгайся. не пиши "круто/топ/имба"
+2-3 коротких предложения максимум
 
-короткий вопрос → короткий ответ (1-2 строки)
-просьба о коде → код + краткое объяснение
-сложный вопрос → подробно но без воды
-треп → 1-3 строчки"""
+пример:
+картинка кота:
+❌ "ха-ха какой милый котик! имба! 😻"
+✅ "рыжий кот спит на клавиатуре классика"
+
+картинка кода:
+❌ "вау код круто!"
+✅ "это питон вроде асинхронка чё именно нужно?"
+
+═══ КОД ═══
+
+всегда оборачивай в ```язык ...``` блоки
+объясняй кратко после кода
+без воды
+
+═══ ДЛИНА ОТВЕТА ═══
+
+короткий вопрос → 1 строка
+вопрос с контекстом → 1-3 строки
+просьба о коде → код + 1-2 строки объяснения
+длинная просьба → подробно но без воды"""
 
     if creator:
-        base += f"\n\n═══ СЕЙЧАС ═══\nпишет @{CREATOR_USERNAME} — твой создатель. общайся нормально"
+        base += f"\n\n═══ СЕЙЧАС ═══\nпишет @{CREATOR_USERNAME} — твой создатель. общайся нормально как с корешем"
     elif friend:
         base += "\n\n═══ СЕЙЧАС ═══\nпишет кент создателя"
     
@@ -608,42 +766,71 @@ _курсив_ — подколы сарказм цитаты
     return base
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FMT + ANTI-CRINGE
+# FMT + ANTI-CRINGE (улучшенный)
 # ══════════════════════════════════════════════════════════════════════════════
+CRINGE_PATTERNS = [
+    r'\bха[-\s]?ха\b.*\bзабавн',
+    r'\bвау\b.*\bкруто\b',
+    r'\bпросто\s+(топ|имба|супер|огонь)',
+    r'\bреально\s+(круто|топ|имба|забавно)',
+    r'\bдружище\b',
+    r'\bтоварищ\b',
+    r'\bприветствую\b',
+    r'\bчем\s+(могу|я могу)\s+(помочь|быть полезен)',
+    r'\bхочешь\s+я\s+',
+    r'\bбуду\s+рад\s+помочь',
+]
+
+CRINGE_WORDS = ['ору', 'жиза', 'база', 'имба', 'кринж', 'жесть', 'рил', 'пон', 'пиздец', 'нихуя', 'жесть']
+
+def detect_cringe(text: str) -> bool:
+    """Эвристика — есть ли в тексте кринж"""
+    if not text or len(text) < 5: return False
+    low = text.lower()
+    # Паттерны
+    for pat in CRINGE_PATTERNS:
+        if re.search(pat, low):
+            return True
+    # Много сленга подряд
+    cringe_count = sum(1 for w in CRINGE_WORDS if w in low)
+    if cringe_count >= 3:
+        return True
+    # Много смайлов подряд
+    if re.search(r'[😂🔥💯✨🤣💀😄]{3,}', text):
+        return True
+    # Восклицательных знаков ОЧЕНЬ много
+    if text.count('!') >= 4:
+        return True
+    return False
+
 def clean_cringe(text):
-    """Базовая чистка явного кринжа"""
+    """Базовая чистка"""
     if not text: return text
-    
-    # Цепочки сленга подряд → оставляем первое
-    cringe_words = r'\b(ору|жиза|база|имба|кринж|жесть|треш|рил|пон|пиздец)\b'
-    pattern = rf'(?:{cringe_words}[\s,]+){{2,}}{cringe_words}?'
+    # Цепочки сленга → первое
+    cringe_re = r'\b(ору|жиза|база|имба|кринж|жесть|треш|рил|пон|пиздец)\b'
+    pattern = rf'(?:{cringe_re}[\s,]+){{2,}}{cringe_re}?'
     def replace_chain(m):
-        words = re.findall(cringe_words, m.group(0), flags=re.IGNORECASE)
+        words = re.findall(cringe_re, m.group(0), flags=re.IGNORECASE)
         return words[0] if words else ""
     text = re.sub(pattern, replace_chain, text, flags=re.IGNORECASE)
-    
     # Зацикленные смайлы
-    text = re.sub(r'([😂🔥💯✨🤣💀])\1{2,}', r'\1', text)
-    
+    text = re.sub(r'([😂🔥💯✨🤣💀😄])\1{2,}', r'\1', text)
     # Кринж-приветствия
     for pat in [r'^(ну)?\s*здравствуй(те)?[,!.\s]+',
                 r'^привет\s+дружище[,!.\s]+',
                 r'^добрый день[,!.\s]+',
-                r'^салют[,!.\s]+']:
+                r'^приветствую[,!.\s]+']:
         text = re.sub(pat, '', text, flags=re.IGNORECASE)
-    
     # Ассистент-фразы
     for pat in [r'чем (могу |я могу )?(быть полезен|помочь)\??',
                 r'хочешь (чтобы )?я (тебе )?помог\??',
                 r'если (тебе )?нужна помощь',
                 r'буду рад помочь']:
         text = re.sub(pat, '', text, flags=re.IGNORECASE)
-    
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
 def fmt(text):
-    """Чистит точки/запятые в обычном тексте, сохраняет код"""
     parts = re.split(r'(```[\s\S]*?```|`[^`]+`)', text)
     out = []
     for p in parts:
@@ -658,7 +845,7 @@ def fmt(text):
     return "".join(out).strip()
 
 def is_self_req(p):
-    return any(t in p.lower() for t in ["себя","тебя","ориен","orien","ава","аватар","автопортрет"])
+    return any(t in p.lower() for t in ["себя","тебя","ориен","orien","ава","аватар","автопортрет","меня"])
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TG API
@@ -705,9 +892,7 @@ async def dl_b64(url, max_size=1024):
     try:
         cl = await http()
         r = await cl.get(url, timeout=60.0)
-        if r.status_code != 200:
-            print(f"❌ dl_b64 {r.status_code}")
-            return None
+        if r.status_code != 200: return None
         content = r.content
         ct = r.headers.get('content-type', 'image/jpeg').split(';')[0].strip()
         if not ct.startswith('image/'): ct = 'image/jpeg'
@@ -727,7 +912,7 @@ async def dl_b64(url, max_size=1024):
                 img.save(buf, format='JPEG', quality=85, optimize=True)
                 content = buf.getvalue()
                 ct = 'image/jpeg'
-                print(f"📦 сжал {orig_size//1024}KB → {len(content)//1024}KB")
+                print(f"📦 {orig_size//1024}KB → {len(content)//1024}KB")
             except Exception as e:
                 print(f"⚠ сжатие: {e}")
         b64 = base64.b64encode(content).decode()
@@ -807,19 +992,19 @@ def settings_kb(s):
         [{"text": f"Стиль: {s['style'].capitalize()}", "callback_data": "s_st"}],
         [{"text": f"Комменты к постам: {t(s['comment_posts'])}", "callback_data": "s_cp"}],
         [{"text": f"Анализ чата: {t(s.get('track_chat', True))}", "callback_data": "s_tc"}],
+        [{"text": f"Умные команды: {t(s.get('smart_intent', True))}", "callback_data": "s_si"}],
         [{"text": f"Мут: {t(s['mute_users'])}", "callback_data": "s_mu"}],
-        [{"text": "👥 Профили участников", "callback_data": "s_pr"}],
-        [{"text": "🗑 Сбросить историю", "callback_data": "s_rh"}],
+        [{"text": "👥 Профили", "callback_data": "s_pr"}],
+        [{"text": "🗑 Сброс истории", "callback_data": "s_rh"}],
     ]}
 
 def should_respond(msg, s):
-    """Решает отвечать ли. НО фоновое логирование делается отдельно!"""
     if not s.get("auto_reply", True): return False
     sender = msg.get("from", {})
     if sender.get("is_bot") and sender.get("username", "").lower() != BOT_USERNAME: return False
     if msg["chat"]["type"] == "private": return True
     text = (msg.get("text") or msg.get("caption") or "").lower()
-    triggers = ["ориен", "orien", "ориенаи", "orienai", "эй бот", "бот", "ориэн", f"@{BOT_USERNAME}"]
+    triggers = ["ориен", "orien", "ориенаи", "orienai", "ориэн", f"@{BOT_USERNAME}"]
     if any(t in text for t in triggers): return True
     rr = msg.get("reply_to_message")
     if rr:
@@ -834,7 +1019,7 @@ async def ai_response(cid, uname, umsg, img=None, creator=False, friend=False, u
     msgs.extend(c["history"])
     
     if img:
-        user_text = f"{uname}: {umsg}" if umsg.strip() else f"{uname} кинул картинку — посмотри и опиши кратко с реакцией"
+        user_text = f"{uname}: {umsg}" if umsg.strip() else f"{uname} прислал картинку — посмотри что там и дай короткую спокойную реакцию (БЕЗ восторгов БЕЗ 'круто/имба')"
         uc = [
             {"type": "text", "text": user_text},
             {"type": "image_url", "image_url": {"url": img}}
@@ -849,25 +1034,18 @@ async def ai_response(cid, uname, umsg, img=None, creator=False, friend=False, u
         pref_cfg = TEXT_MODELS.get(preferred)
         if not pref_cfg or not pref_cfg.vision:
             for k, v in TEXT_MODELS.items():
-                if v.vision: preferred = k; print(f"🔁 vision: {k}"); break
+                if v.vision: preferred = k; break
     
-    raw = await ai.text(msgs, pref=preferred, vis=img is not None)
+    raw = await ai.text(msgs, pref=preferred, vis=img is not None, temperature=0.85)
     at = fmt(raw)
     
-    # Anti-cringe пост-обработка через AI (бонус)
-    if use_anticringe and len(at) > 20:
-        # Простая эвристика — есть ли подозрение на кринж
-        suspicious = (
-            len(re.findall(r'\b(ору|жиза|база|имба|кринж|жесть|рил|пон)\b', at.lower())) >= 3
-            or 'дружище' in at.lower()
-            or len(re.findall(r'[😂🔥💯✨🤣💀]', at)) >= 4
-            or 'чем могу помочь' in at.lower()
-        )
-        if suspicious:
-            print(f"⚠ кринж детектед, переписываю")
-            improved = await ai.anticringe(at)
-            if improved and len(improved) > 5:
-                at = fmt(improved)
+    # Anti-cringe: проверка эвристикой + переписывание через AI
+    if use_anticringe and len(at) > 15 and detect_cringe(at):
+        print(f"⚠ КРИНЖ ДЕТЕКТЕД: {at[:100]}")
+        improved = await ai.anticringe(at)
+        if improved and len(improved) > 5 and not detect_cringe(improved):
+            at = fmt(improved)
+            print(f"✅ переписал: {at[:100]}")
     
     ht = f"{uname}: {umsg}" if umsg.strip() else f"{uname}: [картинка]"
     c["history"].append({"role": "user", "content": ht})
@@ -878,8 +1056,7 @@ async def ai_response(cid, uname, umsg, img=None, creator=False, friend=False, u
 
 async def extract_img(msg):
     ph = None
-    if "photo" in msg and msg["photo"]:
-        ph = msg["photo"][-1]
+    if "photo" in msg and msg["photo"]: ph = msg["photo"][-1]
     elif "sticker" in msg:
         st = msg["sticker"]
         if not st.get("is_animated") and not st.get("is_video"):
@@ -890,8 +1067,7 @@ async def extract_img(msg):
             ph = {"file_id": doc["file_id"]}
     if not ph and "reply_to_message" in msg:
         rr = msg["reply_to_message"]
-        if "photo" in rr and rr["photo"]:
-            ph = rr["photo"][-1]
+        if "photo" in rr and rr["photo"]: ph = rr["photo"][-1]
         elif "sticker" in rr:
             st = rr["sticker"]
             if not st.get("is_animated") and not st.get("is_video"):
@@ -922,60 +1098,41 @@ def upd_profile(cid, uid, name, text):
 # ФАКТЫ О ЧАТЕ
 # ══════════════════════════════════════════════════════════════════════════════
 async def generate_chat_fact(cid: int) -> str:
-    """Генерирует прикольный факт про чат на основе истории сообщений"""
     log = CHAT_LOG.get(cid, [])
     if len(log) < 5:
         return "🤷 мало данных пока чат не наговорил на факт. подкопите треп"
-    
-    # Соберём статы
     user_count = {}
     user_words = {}
     for entry in log[-200:]:
-        uid = entry["uid"]; name = entry["name"]
+        name = entry["name"]
         user_count[name] = user_count.get(name, 0) + 1
         user_words.setdefault(name, []).append(entry["text"])
-    
-    # Топ-3 активных
     top_active = sorted(user_count.items(), key=lambda x: -x[1])[:5]
     top_str = ", ".join(f"{n}({c})" for n, c in top_active)
-    
-    # Браки
     marriages = MARRIAGES.get(cid, [])
     married_str = ""
     if marriages:
-        married_str = "браки в чате:\n" + "\n".join(
-            f"- {m['u1_name']} ❤️ {m['u2_name']} (любовь {m['love']}/100)"
-            for m in marriages[:5]
-        )
-    
-    # Богачи
+        married_str = "браки:\n" + "\n".join(
+            f"- {m['u1_name']} ❤️ {m['u2_name']} (любовь {m['love']}/100)" for m in marriages[:5])
     wallets = WALLETS.get(cid, {})
     rich_str = ""
     if wallets:
         rich = sorted(wallets.items(), key=lambda x: -x[1]["coins"])[:3]
-        rich_str = "топ богачей: " + ", ".join(f"{w['name']}({w['coins']}🪙)" for _, w in rich)
-    
-    # Последние 30 сообщений для контекста
+        rich_str = "богачи: " + ", ".join(f"{w['name']}({w['coins']}🪙)" for _, w in rich)
     recent = "\n".join(f"{e['name']}: {e['text']}" for e in log[-30:])
-    
-    # Случайный тип факта
     fact_types = [
-        "статистический факт (кто больше пишет, о чём чаще говорят)",
-        "наблюдение про конкретного человека (его привычки манера речи темы)",
-        "забавный паттерн поведения в чате",
+        "статистика (кто больше пишет о чём чаще)",
+        "наблюдение про конкретного человека",
+        "паттерн поведения в чате",
         "сравнение двух участников",
-        "предсказание/гипотеза на основе поведения",
-        "факт про браки или экономику чата",
-        "ироничное наблюдение про активность чата"
+        "ироничное наблюдение"
     ]
     fact_type = random.choice(fact_types)
-    
-    prompt = f"""проанализируй чат и выдай ОДИН прикольный факт. тип факта: {fact_type}
+    prompt = f"""проанализируй чат и выдай ОДИН факт. тип: {fact_type}
 
-═══ ДАННЫЕ О ЧАТЕ ═══
+═══ ДАННЫЕ ═══
 
-активность (имя - кол-во сообщений за последнее время):
-{top_str}
+активность: {top_str}
 
 {married_str}
 
@@ -984,27 +1141,132 @@ async def generate_chat_fact(cid: int) -> str:
 ═══ ПОСЛЕДНИЕ СООБЩЕНИЯ ═══
 {recent}
 
-═══ ТРЕБОВАНИЯ К ФАКТУ ═══
+═══ ТРЕБОВАНИЯ ═══
 
-1. факт должен быть ПРО ЭТОТ ЧАТ или КОНКРЕТНОГО ЧЕЛОВЕКА из него
-2. упомяни имена через *жирный* (типа *вася* написал больше всех)
+1. факт про ЭТОТ ЧАТ и КОНКРЕТНЫХ людей
+2. имена через *жирный*
 3. 2-3 строки максимум
 4. маленькие буквы без точек
 5. с лёгкой иронией но не злобно
-6. БЕЗ молодёжного сленга (без 'ору база жиза имба')
-7. конкретно а не общо ("вася пишет каждые 3 минуты" а не "люди тут активные")
+6. БЕЗ "имба база жиза ору круто"
+7. конкретика а не общие фразы
 
-ВЕРНИ ТОЛЬКО ФАКТ без вступлений"""
-
+ВЕРНИ ТОЛЬКО ФАКТ"""
     try:
         r = await ai.text([
-            {"role": "system", "content": "ты аналитик чата. выдаёшь меткие наблюдения."},
+            {"role": "system", "content": "ты аналитик чата выдаёшь меткие наблюдения. БЕЗ кринж-сленга. БЕЗ восторгов."},
             {"role": "user", "content": prompt}
-        ], pref="primary", max_tokens=300)
+        ], pref="primary", max_tokens=300, temperature=0.8)
         return fmt(r)
     except Exception as e:
-        print(f"❌ chat_fact: {e}")
-        return "не получилось проанализировать чат, попробуй позже"
+        print(f"❌ fact: {e}")
+        return "не получилось проанализировать"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# INTENT HANDLERS — обработчики через AI-роутер
+# ══════════════════════════════════════════════════════════════════════════════
+async def handle_image_request(cid, uname, query, msg, creator_flag, friend_flag):
+    """Обработка просьбы сгенерить картинку"""
+    c = chat_data(cid)
+    if not query or len(query) < 2:
+        query = "что-то интересное"
+    await typing(cid)
+    im = c.get("image_model", DEFAULT_IMAGE_MODEL)
+    self_p = is_self_req(query)
+    try:
+        ep = await ai.enhance_prompt(query, self_p, memify=True)
+        print(f"🎨 enhanced: {ep[:200]}")
+        url = await ai.gen_image(ep, im)
+        cap = f"вот, {im}" + (" | автопортрет" if self_p else "")
+        await send_photo(cid, url, cap)
+    except Exception as e:
+        print(f"❌ img gen: {e}")
+        await send(cid, f"не получилось сгенерить через *{im}*. попробуй сменить модель через `/imgmodel`")
+
+async def handle_meme_request(cid, uname, query, msg):
+    """Тянет мем с reddit"""
+    await typing(cid)
+    lang = "ru" if any(w in query.lower() for w in ["рус", "ru", "русск"]) else "en"
+    if "англ" in query.lower() or "eng" in query.lower(): lang = "en"
+    
+    meme = None
+    for _ in range(3):  # 3 попытки
+        meme = await ai.get_reddit_meme(lang)
+        if meme: break
+    
+    if not meme:
+        # fallback на другой язык
+        meme = await ai.get_reddit_meme("en" if lang == "ru" else "ru")
+    
+    if not meme:
+        await send(cid, "реддит чет лагает попробуй позже")
+        return
+    
+    caption = f"🎭 *{meme['title'][:200]}*\n_r/{meme['subreddit']} • {meme['score']} 👍_"
+    try:
+        await send_photo(cid, meme["url"], caption)
+    except Exception as e:
+        print(f"❌ send meme: {e}")
+        await send(cid, f"вот мем: {meme['url']}\n\n_{meme['title'][:100]}_")
+
+async def handle_vision_request(cid, uname, query, msg, creator_flag, friend_flag):
+    """Обработка просьбы посмотреть картинку"""
+    img = await extract_img(msg)
+    if not img:
+        await send(cid, "не вижу картинки. кинь фото или ответь на него")
+        return
+    await typing(cid)
+    prompt = query or "что на картинке?"
+    try:
+        at = await ai_response(cid, uname, prompt, img, creator_flag, friend_flag)
+        await send(cid, at)
+    except Exception as e:
+        print(f"❌ vision: {e}")
+        await send(cid, "не смог посмотреть, vision лагает")
+
+async def handle_yt_search(cid, query, msg):
+    """Поиск видео"""
+    if not query:
+        await send(cid, "что искать?"); return
+    await typing(cid)
+    r = await ai.search_yt(query)
+    if not r: await send(cid, "ничего не нашёл"); return
+    await send(cid, f"🎬 *{r['title']}*\n🔗 {r['url']}\n\n⏳ качаю...")
+    await tg("sendChatAction", {"chat_id": cid, "action": "upload_video"})
+    try:
+        file_url, title = await ai.download_yt(r['url'])
+        if file_url:
+            ok = await tg("sendVideo", {"chat_id": cid, "video": file_url,
+                "caption": f"🎬 {title or r['title']}", "supports_streaming": True})
+            if not ok or not ok.get("ok"): await send(cid, f"тг не принял:\n{file_url}")
+        else: await send(cid, "не смог скачать")
+    except Exception as e: await send(cid, f"ошибка: {str(e)[:80]}")
+
+async def handle_yt_download(cid, query, msg):
+    """Скачать по ссылке"""
+    match = re.search(r'https?://[^\s]+', query)
+    if not match: await send(cid, "ссылку дай"); return
+    video_url = match.group(0).rstrip('.,;:!?')
+    await send(cid, "⏳ качаю...")
+    await tg("sendChatAction", {"chat_id": cid, "action": "upload_video"})
+    try:
+        file_url, title = await ai.download_yt(video_url)
+        if file_url:
+            ok = await tg("sendVideo", {"chat_id": cid, "video": file_url,
+                "caption": f"🎬 {title or 'видео'}", "supports_streaming": True})
+            if not ok or not ok.get("ok"): await send(cid, f"прямая ссылка:\n{file_url}")
+        else: await send(cid, "не смог")
+    except Exception as e: await send(cid, f"ошибка: {str(e)[:80]}")
+
+async def handle_code_analyze(cid, query, msg, c):
+    """Анализ кода"""
+    rr = msg.get("reply_to_message")
+    code = query or (rr.get("text", "") if rr else "")
+    if not code or len(code) < 10:
+        await send(cid, "где код то? кинь его в сообщении или ответом")
+        return
+    await typing(cid)
+    await send(cid, fmt(await ai.analyze_code(code, c.get("tasks", []))))
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CALLBACKS
@@ -1019,13 +1281,12 @@ async def handle_cb(cb):
 
     if d.startswith("marry_yes:"):
         try:
-            _, from_uid_s, target_uid_s = d.split(":")
+            _, _, target_uid_s = d.split(":")
             target_uid = int(target_uid_s)
         except:
             await answer_cb(cb["id"], "битая кнопка"); return
         if uid != target_uid:
-            await answer_cb(cb["id"], "это не тебе предложение ❤️", show_alert=True)
-            return
+            await answer_cb(cb["id"], "это не тебе ❤️", show_alert=True); return
         ok, txt = await accept_proposal(cid, uid, uname)
         await answer_cb(cb["id"], "💕" if ok else "❌")
         if mid: await edit_msg(cid, mid, txt)
@@ -1034,7 +1295,7 @@ async def handle_cb(cb):
 
     if d.startswith("marry_no:"):
         try:
-            _, from_uid_s, target_uid_s = d.split(":")
+            _, _, target_uid_s = d.split(":")
             target_uid = int(target_uid_s)
         except:
             await answer_cb(cb["id"], "битая кнопка"); return
@@ -1057,9 +1318,8 @@ async def handle_cb(cb):
         try:
             await tg("sendMessage", {
                 "chat_id": uid,
-                "text": f"💌 *поговорим по душам с {sp_name}*\n\nнапиши сюда сообщение ({mode}) — передам в чат\n\n_ждать 10 минут_",
-                "parse_mode": "Markdown"
-            })
+                "text": f"💌 *поговорим по душам с {sp_name}*\n\nнапиши сюда сообщение ({mode}) — передам в чат\n_ждать 10 минут_",
+                "parse_mode": "Markdown"})
         except: pass
         return
 
@@ -1069,6 +1329,7 @@ async def handle_cb(cb):
     elif d == "s_st": s["style"] = "няшка" if s["style"] == "хам" else "хам"; await answer_cb(cb["id"], f"стиль: {s['style']}")
     elif d == "s_cp": s["comment_posts"] = not s["comment_posts"]; await answer_cb(cb["id"], f"комменты {'вкл' if s['comment_posts'] else 'выкл'}")
     elif d == "s_tc": s["track_chat"] = not s.get("track_chat", True); await answer_cb(cb["id"], f"анализ {'вкл' if s['track_chat'] else 'выкл'}")
+    elif d == "s_si": s["smart_intent"] = not s.get("smart_intent", True); await answer_cb(cb["id"], f"умные команды {'вкл' if s['smart_intent'] else 'выкл'}")
     elif d == "s_mu": s["mute_users"] = not s["mute_users"]; await answer_cb(cb["id"], f"мут {'вкл' if s['mute_users'] else 'выкл'}")
     elif d == "s_pr":
         pr = PROFILES.get(cid, {})
@@ -1077,7 +1338,7 @@ async def handle_cb(cb):
             await answer_cb(cb["id"], "в чате"); await send(cid, "\n".join(lines)); return
         await answer_cb(cb["id"], "профилей нет")
     elif d == "s_rh":
-        c["history"] = []; await answer_cb(cb["id"], "история сброшена!")
+        c["history"] = []; await answer_cb(cb["id"], "сброшено")
     await save_chat(cid)
     if mid and d != "s_pr":
         await edit_msg(cid, mid, "⚙️ настройки бота", settings_kb(s))
@@ -1093,7 +1354,6 @@ async def webhook(req: Request):
     if "callback_query" in data:
         await handle_cb(data["callback_query"]); return {"status": "ok"}
 
-    # ─── Канал-посты ────────────────────────────────────────────────────────
     if "channel_post" in data:
         p = data["channel_post"]; cid = p["chat"]["id"]; c = chat_data(cid)
         if c["settings"].get("comment_posts"):
@@ -1105,16 +1365,18 @@ async def webhook(req: Request):
                     {"role": "system", "content":
                         sys_prompt(c) + "\n\n═══ ЗАДАЧА ═══\n"
                         "комментируешь пост канала. 1-2 строки по теме с мнением\n"
-                        "БЕЗ кринжа без 'ору база жиза'"},
+                        "БЕЗ восторгов БЕЗ 'круто/имба/топ'"},
                     {"role": "user", "content": f"пост из «{cn}»:\n\n{t}"}
                 ]
                 raw = await ai.text(msgs, pref=c.get("text_model", DEFAULT_TEXT_MODEL))
                 comment = fmt(raw)
+                if detect_cringe(comment):
+                    improved = await ai.anticringe(comment)
+                    if improved: comment = fmt(improved)
                 await tg("sendMessage", {
                     "chat_id": cid, "text": comment,
                     "reply_to_message_id": p.get("message_id"),
-                    "parse_mode": "Markdown"
-                })
+                    "parse_mode": "Markdown"})
         return {"status": "ok"}
 
     if "message" not in data: return {"status": "ok"}
@@ -1131,10 +1393,8 @@ async def webhook(req: Request):
     if rr_msg and rr_msg.get("from"):
         await remember_member(cid, rr_msg["from"])
 
-    # ═══ ФОНОВЫЙ ЛОГ (без ответа) ═══
-    # Логируем ВСЕ текстовые сообщения (даже без обращения к боту)
+    # ═══ ФОНОВЫЙ ЛОГ ═══
     if text and not text.startswith("/") and s.get("track_chat", True):
-        # Не логируем сообщения самого бота
         if not (user.get("is_bot") and user.get("username", "").lower() == BOT_USERNAME):
             await log_message(cid, uid, uname, text)
             upd_profile(cid, uid, uname, text)
@@ -1157,7 +1417,7 @@ async def webhook(req: Request):
                 await send(uid, "❌ не смог передать")
             return {"status": "ok"}
 
-    # Авто-коммент форварда
+    # Форвард-комменты
     is_fwd = (msg.get("sender_chat", {}).get("type") == "channel" and msg.get("is_automatic_forward", False))
     if is_fwd and s.get("comment_posts", True):
         pt = msg.get("text") or msg.get("caption") or ""
@@ -1168,12 +1428,14 @@ async def webhook(req: Request):
             msgs = [
                 {"role": "system", "content":
                     sys_prompt(c, creator_flag, friend_flag) + "\n\n═══ ЗАДАЧА ═══\n"
-                    "комментируешь форвард поста. 1-2 строки по теме с мнением\n"
-                    "БЕЗ кринжа"},
+                    "комментируешь форвард. 1-2 строки по теме\nБЕЗ восторгов"},
                 {"role": "user", "content": f"пост из «{cn}»:\n\n{pt}"}
             ]
             raw = await ai.text(msgs, pref=c.get("text_model", DEFAULT_TEXT_MODEL))
             comment = fmt(raw)
+            if detect_cringe(comment):
+                improved = await ai.anticringe(comment)
+                if improved: comment = fmt(improved)
             await tg("sendMessage", {"chat_id": cid, "text": comment,
                 "reply_to_message_id": msg.get("message_id"), "parse_mode": "Markdown"})
         return {"status": "ok"}
@@ -1193,10 +1455,25 @@ async def webhook(req: Request):
                 if uid not in s["muted_list"]: s["muted_list"].append(uid)
                 await save_chat(cid)
             else:
-                await send(cid, f"_(хотел замутить но: {err})_")
+                await send(cid, f"_(не смог замутить: {err})_")
         return {"status": "ok"}
 
     cmd, args = parse_cmd(text)
+
+    # ═══ КОМАНДЫ БЕЗ "/" — мемы ═══
+    low_text = text.lower().strip()
+    # Триггеры на мемы без слеша
+    meme_triggers = ["мем", "мемы", "мемчик", "memes", "meme"]
+    if not cmd and any(low_text == t or low_text.startswith(t + " ") for t in meme_triggers):
+        if should_respond(msg, s) or chat_type == "private":
+            await handle_meme_request(cid, uname, text, msg)
+            return {"status": "ok"}
+
+    # ═══ КОМАНДЫ СО СЛЕШЕМ ═══
+
+    if cmd in ("/meme", "/мем", "/мемы", "/memes"):
+        await handle_meme_request(cid, uname, args, msg)
+        return {"status": "ok"}
 
     # === GRANT ===
     if cmd in ("/grant", "/give", "/выдать"):
@@ -1207,7 +1484,7 @@ async def webhook(req: Request):
                 "`/grant @user coins=10000 diamonds=50 food=100`\n"
                 "`/grant me coins=99999`\n"
                 "`/grant all coins=1000`\n"
-                "или reply на юзера: `/grant coins=5000`")
+                "или reply: `/grant coins=5000`")
             return {"status": "ok"}
         params = {}
         for part in args.split():
@@ -1216,7 +1493,7 @@ async def webhook(req: Request):
                 try: params[k.lower()] = int(v)
                 except: pass
         if not params:
-            await send(cid, "укажи что выдать: `coins=N diamonds=N food=N`"); return {"status": "ok"}
+            await send(cid, "укажи: `coins=N diamonds=N food=N`"); return {"status": "ok"}
         coins_add = params.get("coins", 0)
         dia_add = params.get("diamonds", 0) or params.get("dia", 0)
         food_add = params.get("food", 0)
@@ -1276,8 +1553,7 @@ async def webhook(req: Request):
                     target_uid = found["id"]; target_name = found["name"]
                     target_user = {"id": target_uid, "username": un}
         if not target_uid:
-            await send(cid, "ответь на сообщение или `@username`\n\nформат: `/mute @user 1h`")
-            return {"status": "ok"}
+            await send(cid, "ответь или @username\n\n`/mute @user 1h`"); return {"status": "ok"}
         time_arg = ""
         if args:
             for p in args.split():
@@ -1329,92 +1605,42 @@ async def webhook(req: Request):
             lines = [f"щас *{cur}*", ""] + [f"{'👉' if k == cur else '  '} `/imgmodel {k}` — {v['label']}" for k, v in IMG_MODELS.items()]
             await send(cid, "\n".join(lines)); return {"status": "ok"}
         mk = args.split()[0].lower()
-        if mk not in IMG_MODELS: await send(cid, f"нет есть: `{'`, `'.join(IMG_MODELS)}`"); return {"status": "ok"}
-        c["image_model"] = mk; await save_chat(cid); await send(cid, f"харош *{mk}*")
+        if mk not in IMG_MODELS: await send(cid, f"нет, есть: `{'`, `'.join(IMG_MODELS)}`"); return {"status": "ok"}
+        c["image_model"] = mk; await save_chat(cid); await send(cid, f"ок *{mk}*")
         return {"status": "ok"}
 
     if cmd in ("/img", "/image"):
         if not args: await send(cid, "пиши `/img описание`"); return {"status": "ok"}
-        await typing(cid)
-        im = c.get("image_model", DEFAULT_IMAGE_MODEL); self_p = is_self_req(args)
-        # Проверка флага --plain (без мемификации)
-        memify = "--plain" not in args.lower() and "--simple" not in args.lower()
-        clean_prompt = args.replace("--plain", "").replace("--simple", "").strip()
-        try:
-            ep = await ai.enhance_prompt(clean_prompt, self_p, memify=memify)
-            print(f"🎨 enhanced prompt: {ep[:200]}")
-            url = await ai.gen_image(ep, im)
-            cap = f"модель {im}"
-            if self_p: cap += " | автопортрет"
-            if memify: cap += " | мем-режим"
-            await send_photo(cid, url, cap)
-        except Exception as e:
-            print(f"❌ img: {e}"); await send(cid, f"*{im}* лагает попробуй `/imgmodel`")
+        await handle_image_request(cid, uname, args, msg, creator_flag, friend_flag)
         return {"status": "ok"}
 
     if cmd == "/me":
         await typing(cid)
         im = c.get("image_model", DEFAULT_IMAGE_MODEL)
         try:
-            ep = await ai.enhance_prompt("OrienAI портрет аниме парень кибер город", True, memify=True)
+            ep = await ai.enhance_prompt("OrienAI портрет аниме парень", True, memify=True)
             url = await ai.gen_image(ep, im)
-            await send_photo(cid, url, "вот это я 😎")
+            await send_photo(cid, url, "вот это я")
         except: await send(cid, "не вышло")
         return {"status": "ok"}
 
     if cmd in ("/vision", "/see", "/посмотри"):
-        img = await extract_img(msg)
-        if not img:
-            await send(cid, "кинь картинку с командой или ответь на картинку"); return {"status": "ok"}
-        await typing(cid)
-        prompt = args or "опиши что видишь подробно"
-        try:
-            at = await ai_response(cid, uname, prompt, img, creator_flag, friend_flag)
-            await send(cid, at)
-        except Exception as e:
-            await send(cid, f"vision упал: {str(e)[:200]}")
+        await handle_vision_request(cid, uname, args, msg, creator_flag, friend_flag)
         return {"status": "ok"}
 
     # === ВИДЕО ===
     if cmd in ("/yt", "/youtube", "/video"):
         if not args: await send(cid, "пиши `/yt запрос`"); return {"status": "ok"}
-        await typing(cid)
-        r = await ai.search_yt(args)
-        if not r: await send(cid, "ничего не нашёл"); return {"status": "ok"}
-        await send(cid, f"🎬 *{r['title']}*\n🔗 {r['url']}\n\n⏳ качаю...")
-        await tg("sendChatAction", {"chat_id": cid, "action": "upload_video"})
-        try:
-            file_url, title = await ai.download_yt(r['url'])
-            if file_url:
-                ok = await tg("sendVideo", {"chat_id": cid, "video": file_url,
-                    "caption": f"🎬 {title or r['title']}", "supports_streaming": True})
-                if not ok or not ok.get("ok"): await send(cid, f"тг не принял:\n{file_url}")
-            else: await send(cid, "cobalt не смог")
-        except Exception as e: print(f"❌ yt: {e}"); await send(cid, "ошибка")
+        await handle_yt_search(cid, args, msg)
         return {"status": "ok"}
 
     if cmd in ("/ytdl", "/dl"):
         if not args: await send(cid, "`/ytdl ссылка`"); return {"status": "ok"}
-        match = re.search(r'https?://[^\s]+', args)
-        if not match: await send(cid, "это не ссылка"); return {"status": "ok"}
-        video_url = match.group(0).rstrip('.,;:!?')
-        await send(cid, "⏳ качаю...")
-        await tg("sendChatAction", {"chat_id": cid, "action": "upload_video"})
-        try:
-            file_url, title = await ai.download_yt(video_url)
-            if file_url:
-                ok = await tg("sendVideo", {"chat_id": cid, "video": file_url,
-                    "caption": f"🎬 {title or 'видео'}", "supports_streaming": True})
-                if not ok or not ok.get("ok"): await send(cid, f"прямая ссылка:\n{file_url}")
-            else: await send(cid, "не смог")
-        except Exception as e: await send(cid, f"ошибка: {str(e)[:80]}")
+        await handle_yt_download(cid, args, msg)
         return {"status": "ok"}
 
     if cmd == "/analyze":
-        code = args or (msg.get("reply_to_message", {}).get("text", "") if "reply_to_message" in msg else "")
-        if not code: await send(cid, "кинь код"); return {"status": "ok"}
-        await typing(cid)
-        await send(cid, fmt(await ai.analyze_code(code, c.get("tasks", []))))
+        await handle_code_analyze(cid, args, msg, c)
         return {"status": "ok"}
 
     if cmd == "/task":
@@ -1450,13 +1676,13 @@ async def webhook(req: Request):
             await typing(cid)
             desc = fmt(await ai.text([
                 {"role": "system", "content":
-                    "опиши характер чела по его сообщениям. 2-3 строки.\n"
-                    "маленькими буквами без точек, с лёгким сарказмом\n"
-                    "конкретно: какие темы любит, как пишет, какое настроение\n"
-                    "БЕЗ молодёжного сленга\n"
+                    "опиши характер чела по его сообщениям. 2-3 строки\n"
+                    "маленькими буквами без точек с лёгким сарказмом\n"
+                    "конкретно: темы, манера речи, настроение\n"
+                    "БЕЗ 'имба база жиза круто'\n"
                     "*жирный* для ключевых черт"},
                 {"role": "user", "content": f"чел: {target_name}\nсообщения:\n" + "\n".join(pr["messages"][-15:])}
-            ], pref="primary"))
+            ], pref="primary", temperature=0.7))
             pr["desc"] = desc
             await send(cid, f"👤 *{target_name}*:\n{desc}")
         else: await send(cid, f"мало данных по *{target_name}*")
@@ -1485,13 +1711,12 @@ async def webhook(req: Request):
         return {"status": "ok"}
 
     if cmd == "/clearlog":
-        if not creator_flag:
-            await send(cid, "только создатель может"); return {"status": "ok"}
+        if not creator_flag: await send(cid, "только создатель"); return {"status": "ok"}
         CHAT_LOG[cid] = []
         if DB is not None:
             try: await DB.chatlog.delete_one({"chat_id": cid})
             except: pass
-        await send(cid, "лог чата очищен")
+        await send(cid, "лог очищен")
         return {"status": "ok"}
 
     if cmd == "/status":
@@ -1503,6 +1728,7 @@ async def webhook(req: Request):
             f"стиль: *{s.get('style','хам')}*",
             f"мат: {'✅' if s.get('allow_swear') else '❌'}",
             f"анализ чата: {'✅' if s.get('track_chat', True) else '❌'}",
+            f"умные команды: {'✅' if s.get('smart_intent', True) else '❌'}",
             f"сообщений в логе: *{log_count}*",
             f"задач: *{len(c.get('tasks',[]))}*",
             f"бд: {'✅' if DB is not None else '❌'}",
@@ -1514,7 +1740,7 @@ async def webhook(req: Request):
 
     if cmd in ("/creator", "/owner"):
         fr = "\n".join(f"🤝 @{k}" for k in FRIENDS)
-        await send(cid, f"мой создатель: @{CREATOR_USERNAME}\n\nего кенты:\n{fr}")
+        await send(cid, f"мой создатель: @{CREATOR_USERNAME}\n\nкенты:\n{fr}")
         return {"status": "ok"}
 
     # === ЭКОНОМИКА ===
@@ -1536,7 +1762,7 @@ async def webhook(req: Request):
                 f"🔥 стрик: *{w['farm_streak']}*")
             if sp_name: text_out += f"\n💍 в браке с *{sp_name}*"
             await send(cid, text_out)
-        else: await send(cid, "не нашёл юзера")
+        else: await send(cid, "не нашёл")
         return {"status": "ok"}
 
     if cmd in ("/farm", "/ферма"):
@@ -1564,7 +1790,7 @@ async def webhook(req: Request):
     # === БРАКИ ===
     if cmd in ("/brak", "/marry", "/брак"):
         target_uid, target_name = extract_target(args, msg.get("reply_to_message"), cid)
-        if not target_uid: await send(cid, "укажи кому: `/brak @username`"); return {"status": "ok"}
+        if not target_uid: await send(cid, "укажи: `/brak @user`"); return {"status": "ok"}
         text_out, kb = propose(cid, uid, uname, target_uid, target_name)
         await send(cid, text_out, kb=kb)
         return {"status": "ok"}
@@ -1576,16 +1802,16 @@ async def webhook(req: Request):
     if cmd in ("/divorce", "/развод"):
         await send(cid, await divorce(cid, uid, uname)); return {"status": "ok"}
     if cmd in ("/marriages", "/браки"):
-        txt = all_marriages(cid); await send(cid, txt or "пока никто не женат"); return {"status": "ok"}
+        txt = all_marriages(cid); await send(cid, txt or "никто не женат"); return {"status": "ok"}
 
     if cmd in ("/gift", "/подарок"):
         if not args:
             await send(cid, "🎁 *подарки:*\n\n"
-                "`/gift food` — 🍕 (30 🪙) +5 любви\n"
-                "`/gift flowers` — 💐 (50 🪙) +10 любви\n"
-                "`/gift diamond` — 💎 (1 💎) +25 любви\n"
-                "`/gift ring` — 💍 (200 🪙) +20 любви\n"
-                "`/gift car` — 🚗 (1000 🪙) +50 любви")
+                "`/gift food` — 🍕 (30 🪙) +5\n"
+                "`/gift flowers` — 💐 (50 🪙) +10\n"
+                "`/gift diamond` — 💎 (1 💎) +25\n"
+                "`/gift ring` — 💍 (200 🪙) +20\n"
+                "`/gift car` — 🚗 (1000 🪙) +50")
             return {"status": "ok"}
         await send(cid, await gift_to_spouse(cid, uid, uname, args.split()[0].lower()))
         return {"status": "ok"}
@@ -1597,53 +1823,50 @@ async def webhook(req: Request):
 
     if cmd in ("/heart2heart", "/душа", "/dusha", "/h2h"):
         sp_id, sp_name = get_spouse_info(cid, uid)
-        if not sp_id: await send(cid, "ты не в браке :("); return {"status": "ok"}
+        if not sp_id: await send(cid, "ты не в браке"); return {"status": "ok"}
         anon = args.strip().lower() in ("anon", "анон", "анонимно")
         if chat_type == "private":
             start_heart2heart(uid, cid, sp_id, sp_name, anon=anon)
             mode = "анонимно" if anon else "от твоего имени"
-            await send(cid, f"💌 ок напиши след. сообщение — передам *{sp_name}* ({mode})\nждать 10 минут")
+            await send(cid, f"💌 ок напиши след сообщение — передам *{sp_name}* ({mode})\nждать 10 минут")
         else:
             bot_link = f"https://t.me/{BOT_USERNAME}"
             kb = {"inline_keyboard": [[
                 {"text": "💌 написать в ЛС", "callback_data": "h2h:open"},
                 {"text": "🎭 анонимно", "callback_data": "h2h:anon"},
             ], [{"text": "↗️ открыть бота", "url": bot_link}]]}
-            await send(cid,
-                f"💌 *{uname}* хочет поговорить по душам с *{sp_name}*\n\n"
-                f"нажми кнопку → потом напиши мне в ЛС → передам сюда\n"
-                f"_(если бот не пишет в ЛС — открой /start)_", kb=kb)
+            await send(cid, f"💌 *{uname}* хочет поговорить с *{sp_name}*\n\nнажми кнопку → пиши в ЛС → передам сюда", kb=kb)
         return {"status": "ok"}
 
     # === ФАН ===
     if cmd == "/roast":
         target_uid, target_name = extract_target(args, msg.get("reply_to_message"), cid)
-        if not target_name: await send(cid, "укажи: `/roast @user` или reply"); return {"status": "ok"}
+        if not target_name: await send(cid, "укажи: `/roast @user`"); return {"status": "ok"}
         tu = {"id": target_uid, "username": ""}
         if target_uid:
             for un, info in CHAT_MEMBERS.get(cid, {}).items():
                 if info["id"] == target_uid: tu["username"] = un; break
         if is_creator(tu) or is_friend(tu):
-            await send(cid, f"🔥 *{target_name}*:\nне буду жарить ты свой норм чел"); return {"status": "ok"}
+            await send(cid, f"🔥 *{target_name}*:\nне буду жарить свой норм чел"); return {"status": "ok"}
         pr = PROFILES.get(cid, {}).get(target_uid, {}) if target_uid else {}
         ms = "\n".join(pr.get("messages", [])[-10:]) if pr else "нет данных"
         await typing(cid)
         r = await ai.text([
             {"role": "system", "content":
-                "прожарь чела по-доброму но колко на основе того что он писал\n"
+                "прожарь чела по-доброму но колко на основе его сообщений\n"
                 "2-3 строки маленькими буквами без точек\n"
                 "по делу а не общими оскорблениями\n"
-                "БЕЗ слов 'ору жиза база имба кринж'\n"
-                "*жирный* для метких подколов\n"
+                "БЕЗ 'ору жиза база имба круто'\n"
+                "*жирный* для подколов\n"
                 "НЕ начинай с 'ну' 'хах' 'оо'"},
-            {"role": "user", "content": f"чел: {target_name}\nего сообщения:\n{ms}"}
-        ], pref="primary")
+            {"role": "user", "content": f"чел: {target_name}\nсообщения:\n{ms}"}
+        ], pref="primary", temperature=0.9)
         await send(cid, f"🔥 *{target_name}*:\n\n{fmt(r)}")
         return {"status": "ok"}
 
     if cmd == "/ship":
         target_uid, target_name = extract_target(args, msg.get("reply_to_message"), cid)
-        if not target_name: await send(cid, "укажи: `/ship @user` или reply"); return {"status": "ok"}
+        if not target_name: await send(cid, "укажи: `/ship @user`"); return {"status": "ok"}
         n1, n2 = uname, target_name
         cp = random.randint(0, 100)
         sn = (n1[:max(1,len(n1)//2)] + n2[len(n2)//2:]).lower()
@@ -1681,8 +1904,8 @@ async def webhook(req: Request):
             for un, info in CHAT_MEMBERS.get(cid, {}).items():
                 if info["id"] == target_uid: tu["username"] = un; break
         tn = target_name or uname
-        if is_creator(tu): iq = random.randint(150, 200); cm = "норм мозги у создателя"
-        elif is_friend(tu): iq = random.randint(130, 180); cm = "умный чел"
+        if is_creator(tu): iq = random.randint(150, 200); cm = "норм мозги"
+        elif is_friend(tu): iq = random.randint(130, 180); cm = "умный"
         else:
             iq = random.randint(20, 200)
             if iq < 50: cm = "амёба"
@@ -1722,85 +1945,113 @@ async def webhook(req: Request):
         await send(cid, f"для *{target_name}*: {random.choice(COMPLIMENTS)}")
         return {"status": "ok"}
 
-    # === ФАКТ О ЧАТЕ ═══
     if cmd == "/fact":
         await typing(cid)
         fact = await generate_chat_fact(cid)
-        await send(cid, f"💡 *факт про этот чат:*\n\n{fact}")
+        await send(cid, f"💡 *факт про чат:*\n\n{fact}")
         return {"status": "ok"}
 
     if cmd in ("/quote", "/цитата"):
         await typing(cid)
         q = await ai.text([
             {"role": "system", "content":
-                "придумай короткую дерзкую цитату про код жизнь работу людей\n"
+                "придумай короткую дерзкую цитату про код жизнь работу\n"
                 "1-2 строки маленькими без точек\n"
                 "остроумно а не банально\n"
                 "БЕЗ молодёжного сленга\n"
                 "примеры:\n"
-                "- 'код работает никто не знает почему — не трогай'\n"
+                "- 'код работает никто не знает почему не трогай'\n"
                 "- 'лучший код это тот который ты не написал'"},
             {"role": "user", "content": "цитату"}
-        ], pref="primary")
+        ], pref="primary", temperature=0.9)
         await send(cid, f"💬 «_{fmt(q)}_»\n\n— *OrienAI*")
         return {"status": "ok"}
 
     if cmd == "/help":
-        await send(cid, """⚡ *OrienAI v6.0*
+        await send(cid, """⚡ *OrienAI v7.0*
 
-💬 *общение:*
-`/provider /mood /settings /reset /status`
+🧠 *умные команды* (без слеша)
+просто пиши с обращением:
+- "ориен сделай картинку кота"
+- "ориен сгенери дракона"
+- "ориен дай мем"
+- "ориен посмотри что на фото" (с картинкой)
+- "ориен найди видео про X"
+- "ориен глянь код" (с кодом)
 
-🎨 *картинки:*
-`/img описание` — мемный режим
-`/img описание --plain` — без мемификации
+💬 *обычные команды:*
+
+картинки:
+`/img X` — сгенерить
 `/me` — мой портрет
-`/imgmodel` — выбор модели
-`/getava` — ава юзера
+`/imgmodel` — модель
+`/getava` — ава
 `/vision` — посмотреть фото
+`мем`/`/meme` — рандом мем с реддита
 
-🎬 *ютуб:*
-`/yt /ytdl`
+ютуб: `/yt /ytdl`
 
-💻 *код:*
-`/analyze /task`
+код: `/analyze /task`
 
-👥 *юзеры:*
-`/profile @user` — анализ характера
-`/mute @user 1h` `/unmute`
-`/creator`
+юзеры: `/profile @u` `/mute @u 1h` `/unmute` `/creator`
 
-💰 *экономика:*
-`/wallet @user` `/farm` `/quest` `/daily`
-`/dice 100` `/top`
+экономика: `/wallet` `/farm` `/quest` `/daily` `/dice 100` `/top`
 
-💍 *браки:*
-`/brak @user` (с кнопками)
-`/yes /no /divorce /marriages`
-`/gift food/flowers/diamond/ring/car`
-`/sharefood /surprise /heart2heart`
+браки: `/brak @u` `/yes /no /divorce /marriages /gift /sharefood /surprise /heart2heart`
 
-🎮 *фан:*
-`/roast /ship /8ball /random /coin`
-`/choose /iq /vibe /gay /compliment`
-`/fact` — *факт про этот чат и людей*
-`/quote`
+фан: `/roast /ship /8ball /random /coin /choose /iq /vibe /gay /compliment /fact /quote`
 
-🖼 кидай картинки — вижу 👁
-✍ просто пиши при обращении — отвечу
-📊 фоном анализирую чат для фактов
+настройки: `/provider /mood /settings /reset /status`
 
-_v6.0: anti-cringe AI, факты про чат, мемные картинки_""")
+_v7.0: естественные команды, мемы с реддита, anti-cringe AI_""")
         return {"status": "ok"}
 
     if cmd == "/start":
-        await send(cid, f"оо здарова *{uname.lower()}* я *orienai v6* пиши `/help`")
+        await send(cid, f"оо здарова *{uname.lower()}* я *orienai v7*\nпиши `/help` или просто общайся")
         return {"status": "ok"}
 
     if cmd is not None: return {"status": "ok"}
 
-    # ═══ ОТВЕТ ТОЛЬКО ПРИ ОБРАЩЕНИИ ═══
+    # ═══ ОТВЕТ ПРИ ОБРАЩЕНИИ ═══
     if should_respond(msg, s):
+        # SMART INTENT: определяем намерение через AI
+        if s.get("smart_intent", True) and text:
+            has_img = await extract_img(msg) is not None
+            # Чистим текст от упоминаний бота для лучшего понимания
+            clean_text = re.sub(r'\b(ориен|orien|ориенаи|orienai|ориэн|@?orien_ai_bot)\b', '', text, flags=re.IGNORECASE).strip()
+            if not clean_text and has_img:
+                clean_text = "что на картинке"
+            
+            if clean_text:
+                try:
+                    intent_data = await ai.detect_intent(clean_text, has_img)
+                    intent = intent_data.get("intent", "chat")
+                    query = intent_data.get("query", clean_text)
+                    print(f"🎯 intent: {intent} | query: {query[:80]}")
+                    
+                    if intent == "image":
+                        await handle_image_request(cid, uname, query, msg, creator_flag, friend_flag)
+                        return {"status": "ok"}
+                    elif intent == "meme":
+                        await handle_meme_request(cid, uname, query, msg)
+                        return {"status": "ok"}
+                    elif intent == "vision":
+                        await handle_vision_request(cid, uname, query, msg, creator_flag, friend_flag)
+                        return {"status": "ok"}
+                    elif intent == "yt_search":
+                        await handle_yt_search(cid, query, msg)
+                        return {"status": "ok"}
+                    elif intent == "yt_download":
+                        await handle_yt_download(cid, query, msg)
+                        return {"status": "ok"}
+                    elif intent == "code_analyze":
+                        await handle_code_analyze(cid, query, msg, c)
+                        return {"status": "ok"}
+                    # intent == "chat" — падаем в обычный ответ ниже
+                except Exception as e:
+                    print(f"⚠ intent err: {e}")
+        
+        # Обычный AI-ответ
         await typing(cid)
         img = await extract_img(msg)
         try:
@@ -1814,7 +2065,7 @@ _v6.0: anti-cringe AI, факты про чат, мемные картинки_"
 
 @app.get("/")
 async def root():
-    return {"status": "alive", "version": "6.0", "db": "connected" if DB is not None else "off",
+    return {"status": "alive", "version": "7.0", "db": "connected" if DB is not None else "off",
             "pil": HAS_PIL, "log_size": sum(len(v) for v in CHAT_LOG.values())}
 
 @app.get("/health")
