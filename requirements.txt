@@ -3,4 +3,4 @@ uvicorn
 httpx
 motor
 Pillow
-python-multipart 
+python-multipart
