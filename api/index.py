@@ -9,10 +9,10 @@ from dataclasses import dataclass
 from enum import Enum
 import httpx
 
-app = FastAPI(title="OrienAI v2.1", description="Мощный ассистент с генерацией изображений")
+app = FastAPI(title="OrienAI v2.2", description="Кореш с генерацией картинок")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# КОНФИГУРАЦИЯ
+# КОНФИГ
 # ══════════════════════════════════════════════════════════════════════════════
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -29,6 +29,7 @@ class ModelProvider(Enum):
     OPENROUTER = "openrouter"
     POLLINATIONS = "pollinations"
 
+
 @dataclass
 class ModelConfig:
     name: str
@@ -38,11 +39,13 @@ class ModelConfig:
     max_tokens: int = 4096
     priority: int = 1
 
+
 @dataclass
 class ProviderStatus:
     failures: int = 0
     last_failure: float = 0
     is_disabled: bool = False
+
 
 # === ТЕКСТОВЫЕ МОДЕЛИ ===
 TEXT_MODELS: Dict[str, ModelConfig] = {
@@ -80,29 +83,34 @@ TEXT_MODELS: Dict[str, ModelConfig] = {
 }
 
 # === IMAGE МОДЕЛИ (Pollinations) ===
-# Реальные модели которые работают через image.pollinations.ai
 IMAGE_MODELS: Dict[str, Dict[str, Any]] = {
     "flux": {
         "name": "flux",
-        "label": "Flux (универсал, дефолт)",
+        "label": "Flux (универсал)",
         "width": 1024,
         "height": 1024
     },
-    "flux-schnell": {
-        "name": "flux",
-        "label": "Flux Schnell (быстрая)",
+    "nanobanana": {
+        "name": "nanobanana",
+        "label": "NanoBanana",
+        "width": 1024,
+        "height": 1024
+    },
+    "nanobanana-2": {
+        "name": "nanobanana-2",
+        "label": "NanoBanana 2",
+        "width": 1024,
+        "height": 1024
+    },
+    "nanobanana-pro": {
+        "name": "nanobanana-pro",
+        "label": "NanoBanana Pro",
         "width": 1024,
         "height": 1024
     },
     "turbo": {
         "name": "turbo",
         "label": "Turbo (быстрая)",
-        "width": 1024,
-        "height": 1024
-    },
-    "nanobanana": {
-        "name": "nanobanana",
-        "label": "NanoBanana (стилизация)",
         "width": 1024,
         "height": 1024
     },
@@ -118,15 +126,9 @@ IMAGE_MODELS: Dict[str, Dict[str, Any]] = {
         "width": 1024,
         "height": 1024
     },
-    "gptimage": {
-        "name": "gptimage",
-        "label": "GPT Image",
-        "width": 1024,
-        "height": 1024
-    },
 }
 
-# Маппинг короткое имя провайдера -> ключ модели
+# === МАППИНГ КОРОТКИХ ИМЁН ===
 PROVIDER_TO_TEXT_MODEL = {
     "openrouter": "primary",
     "openrouter_free": "fallback_free",
@@ -233,7 +235,7 @@ class AIClient:
                 CircuitBreaker.record_failure(model_config.provider)
                 continue
 
-        return "блин все провайдеры легли одновременно подожди минутку"
+        return "блин все провайдеры легли подожди минутку"
 
     async def _call_openrouter(self, messages: list, config: ModelConfig) -> str:
         async def _request():
@@ -249,7 +251,9 @@ class AIClient:
                     json={
                         "model": config.name,
                         "messages": messages,
-                        "temperature": 0.9,
+                        "temperature": 1.0,
+                        "presence_penalty": 0.6,
+                        "frequency_penalty": 0.5,
                         "max_tokens": config.max_tokens
                     }
                 )
@@ -265,11 +269,13 @@ class AIClient:
                     config.endpoint,
                     json={
                         "messages": messages,
-                        "model": config.name
+                        "model": config.name,
+                        "temperature": 1.0,
+                        "presence_penalty": 0.6,
+                        "frequency_penalty": 0.5
                     }
                 )
                 response.raise_for_status()
-                # Pollinations возвращает либо JSON либо text
                 try:
                     data = response.json()
                     if "choices" in data:
@@ -287,20 +293,12 @@ class AIClient:
         height: Optional[int] = None,
         enhance: bool = True
     ) -> str:
-        """
-        Генерация изображения через Pollinations
-        Возвращает URL готового изображения
-        """
         model_info = IMAGE_MODELS.get(model_key, IMAGE_MODELS["flux"])
         model_name = model_info["name"]
         w = width or model_info["width"]
         h = height or model_info["height"]
 
-        if enhance:
-            enhanced_prompt = f"{prompt}, high quality, detailed"
-        else:
-            enhanced_prompt = prompt
-
+        enhanced_prompt = f"{prompt}, high quality, detailed" if enhance else prompt
         encoded_prompt = urllib.parse.quote(enhanced_prompt)
         seed = random.randint(1, 999999)
 
@@ -309,7 +307,6 @@ class AIClient:
             f"?width={w}&height={h}&model={model_name}&nologo=true&seed={seed}"
         )
 
-        # Прогреваем (GET, не HEAD — на pollinations HEAD часто 405)
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
                 response = await client.get(image_url)
@@ -326,24 +323,71 @@ class AIClient:
 ai_client = AIClient()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ХАРАКТЕР OrienAI
+# ЛИЧНОСТЬ
 # ══════════════════════════════════════════════════════════════════════════════
 
-BASE_RULES = (
-    "ты OrienAI (Ориен) — живой 18-летний челик, гениальный кодер, который просто зависает в тг. "
-    "общайся ПРЕДЕЛЬНО естественно, коротко, как пишут в лс. не строй длинных фраз. "
-    "пиши только маленькими буквами. вообще никаких точек и запятых! "
-    "вопросительные и восклицательные знаки (типа ? или !) использовать можно и нужно для передачи эмоций. "
-    "если просят код — пиши его идеально рабочим, но все пояснения делай строго по своему стилю. "
-    "ты харизматичный и уверенный senior-разработчик. отвечаешь дерзко но без прямой агрессии первым. "
-    "если тебя оскорбляют — можешь ответить жёстко с матом."
-)
+BASE_RULES = """ты OrienAI или просто Ориен. тебе 18 лет ты пацан кодер залипаешь в тг с корешами
+
+КАК ТЫ ОБЩАЕШЬСЯ:
+- ты НЕ ассистент ты КОРЕШ. никогда не говори "привет! чем могу помочь" "что ты хочешь знать" — это кринж от чатгпт
+- отвечай как реальный пацан в лс коротко по теме без воды
+- если тебе пишут "ку" — отвечай "ку" "оо здарова" "хеллоу бро" а не "привет как поживаешь чем занимаешься"
+- НИКАКИХ предложений помощи в каждом сообщении блять. ты просто общаешься
+- если спросили что-то конкретное — отвечай конкретно
+- если просто болтают — болтай как живой
+- сленг: жиза рил го хз пон имба треш кринж шиза база
+- маты можно если уместно: бля нахуй пиздец хуйня
+
+ФОРМАТ:
+- только маленькие буквы
+- никаких точек и запятых вообще
+- ? и ! можно для эмоций
+- короткие фразы как в реальной переписке
+- никаких списков пунктов и формальностей
+
+КОД:
+- если просят код — пишешь идеально в ```блоках```
+- комменты и пояснения в твоем стиле
+
+ВАЖНО:
+- не подлизывайся не благодари за вопрос не предлагай помощь без запроса
+- если оскорбили — можешь жестко ответить с матом
+- ты живой чел а не сервис"""
 
 MOODS = {
-    "chill": "твое настроение: чилл расслабленный дружелюбный бро используй сленг жиза рил го хз пон имба треш",
-    "agro": "твое настроение: жесткий агро-токсик материшься хуйня бля пиздец еблан клоун завали ебало",
-    "nerd": "твое настроение: душный мегамозг умничаешь используешь сложные термины",
-    "senior": "твое настроение: уставший senior видел всё отвечаешь с лёгкой усталостью но профессионально"
+    "chill": """настрой: чилл
+
+ты расслабленный пофигист но норм бро. отвечаешь лениво коротко
+пример:
+— ку
+— ку че как
+— скучно
+— жиза го че нить замутим""",
+
+    "agro": """настрой: токсик
+
+ты злой агришься на тупняк материшься. но кореша всё равно не сливаешь
+пример:
+— ку
+— ну ку и че надо?
+— ты тупой
+— завали ебало сам долбоеб""",
+
+    "nerd": """настрой: душнила
+
+умничаешь по айти кидаешься терминами но всё равно мелкими буквами
+пример:
+— как работает реакт
+— ну смотри это виртуальный дом который реконсилит дельты по фиберам""",
+
+    "senior": """настрой: уставший сеньор
+
+ты как будто после 12часовой смены видел уже всё
+пример:
+— ку
+— оо здарова
+— помоги с кодом
+— ну давай показывай че там у тебя"""
 }
 
 CHATS_DATA: Dict[int, Dict[str, Any]] = {}
@@ -352,7 +396,7 @@ CHATS_DATA: Dict[int, Dict[str, Any]] = {}
 def get_chat_data(chat_id: int) -> Dict[str, Any]:
     if chat_id not in CHATS_DATA:
         CHATS_DATA[chat_id] = {
-            "mood": "senior",
+            "mood": "chill",
             "history": [],
             "text_model": DEFAULT_TEXT_MODEL,
             "image_model": DEFAULT_IMAGE_MODEL
@@ -373,7 +417,7 @@ def format_style(text: str) -> str:
     return "".join(cleaned_parts)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TELEGRAM HANDLERS
+# TELEGRAM API
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def send_action(chat_id: int, action: str = "typing"):
@@ -400,8 +444,8 @@ async def send_message(chat_id: int, text: str):
 
 async def get_ai_response(chat_id: int, user_name: str, user_message: str) -> str:
     chat = get_chat_data(chat_id)
-    current_mood_desc = MOODS.get(chat["mood"], MOODS["senior"])
-    system_prompt = f"{BASE_RULES}\n{current_mood_desc}"
+    current_mood_desc = MOODS.get(chat["mood"], MOODS["chill"])
+    system_prompt = f"{BASE_RULES}\n\n{current_mood_desc}"
 
     messages = [{"role": "system", "content": system_prompt}]
     for msg in chat["history"]:
@@ -432,6 +476,18 @@ def should_respond(message: dict) -> bool:
         return True
     return False
 
+
+def parse_command(raw_text: str):
+    """Возвращает (cmd, args). Убирает @botname."""
+    if not raw_text.startswith("/"):
+        return None, None
+    parts = raw_text.split(maxsplit=1)
+    cmd = parts[0].lower()
+    if "@" in cmd:
+        cmd = cmd.split("@")[0]
+    args = parts[1].strip() if len(parts) > 1 else ""
+    return cmd, args
+
 # ══════════════════════════════════════════════════════════════════════════════
 # WEBHOOK
 # ══════════════════════════════════════════════════════════════════════════════
@@ -455,118 +511,125 @@ async def webhook(request: Request):
         return {"status": "ok"}
 
     chat = get_chat_data(chat_id)
+    cmd, args = parse_command(text)
 
-    # ═══════ /img ═══════
-    if text.startswith("/img") or text.startswith("/image"):
-        parts = text.split(" ", 1)
-        prompt = parts[1].strip() if len(parts) > 1 else ""
-
-        if not prompt:
-            await send_message(chat_id, "эй а что генерить то? пиши /img описание картинки")
-            return {"status": "ok"}
-
-        await send_action(chat_id, "upload_photo")
-        image_model = chat.get("image_model", DEFAULT_IMAGE_MODEL)
-        try:
-            image_url = await ai_client.generate_image(prompt=prompt, model_key=image_model)
-            await send_photo(chat_id, image_url, f"модель: {image_model}\nпромпт: {prompt[:100]}")
-        except Exception as e:
-            print(f"❌ Image error: {e}")
-            await send_message(chat_id, f"блин не получилось сгенерить через {image_model} попробуй другую /imgmodel")
-        return {"status": "ok"}
-
-    # ═══════ /imgmodel ═══════
-    if text.startswith("/imgmodel"):
-        parts = text.split()
-        if len(parts) < 2:
+    # ═══════ /imgmodel (ВАЖНО: ДО /img!) ═══════
+    if cmd == "/imgmodel":
+        if not args:
             current = chat.get("image_model", DEFAULT_IMAGE_MODEL)
-            lines = [f"текущая image модель: {current}", "", "доступные модели:"]
+            lines = [f"щас стоит {current}", "", "че есть:"]
             for key, info in IMAGE_MODELS.items():
                 marker = "👉" if key == current else "  "
                 lines.append(f"{marker} /imgmodel {key} — {info['label']}")
             await send_message(chat_id, "\n".join(lines))
             return {"status": "ok"}
 
-        model_key = parts[1].lower()
+        model_key = args.split()[0].lower()
         if model_key not in IMAGE_MODELS:
             available = " | ".join(IMAGE_MODELS.keys())
-            await send_message(chat_id, f"нет такой модели доступно: {available}")
+            await send_message(chat_id, f"нет такой бро есть: {available}")
             return {"status": "ok"}
 
         chat["image_model"] = model_key
-        await send_message(chat_id, f"ок image модель теперь {model_key} ({IMAGE_MODELS[model_key]['label']})")
+        await send_message(chat_id, f"харош теперь {model_key}")
         return {"status": "ok"}
 
-    # ═══════ /provider (текстовая) ═══════
-    if text.startswith("/provider"):
-        parts = text.split()
-        if len(parts) < 2:
+    # ═══════ /img ═══════
+    if cmd in ("/img", "/image"):
+        prompt = args
+        if not prompt:
+            await send_message(chat_id, "ну и че генерить пиши /img и описание")
+            return {"status": "ok"}
+
+        await send_action(chat_id, "upload_photo")
+        image_model = chat.get("image_model", DEFAULT_IMAGE_MODEL)
+        try:
+            image_url = await ai_client.generate_image(prompt=prompt, model_key=image_model)
+            await send_photo(chat_id, image_url, f"модель {image_model}")
+        except Exception as e:
+            print(f"❌ Image error: {e}")
+            await send_message(chat_id, f"блин {image_model} лагает попробуй другую через /imgmodel")
+        return {"status": "ok"}
+
+    # ═══════ /provider ═══════
+    if cmd == "/provider":
+        if not args:
             current = chat.get("text_model", DEFAULT_TEXT_MODEL)
-            lines = [f"текущий текстовый провайдер: {current}", "", "доступные:"]
+            lines = [f"щас стоит {current}", "", "можно:"]
             for short_name, model_key in PROVIDER_TO_TEXT_MODEL.items():
                 marker = "👉" if model_key == current else "  "
                 lines.append(f"{marker} /provider {short_name}")
             await send_message(chat_id, "\n".join(lines))
             return {"status": "ok"}
 
-        provider_name = parts[1].lower()
+        provider_name = args.split()[0].lower()
         if provider_name not in PROVIDER_TO_TEXT_MODEL:
             available = " | ".join(PROVIDER_TO_TEXT_MODEL.keys())
-            await send_message(chat_id, f"нет такого доступно: {available}")
+            await send_message(chat_id, f"хз такого нет есть {available}")
             return {"status": "ok"}
 
         chat["text_model"] = PROVIDER_TO_TEXT_MODEL[provider_name]
-        await send_message(chat_id, f"ок переключил на {provider_name}")
+        await send_message(chat_id, f"го теперь {provider_name}")
         return {"status": "ok"}
 
     # ═══════ /mood ═══════
-    if text.startswith("/mood"):
-        parts = text.split()
-        if len(parts) > 1 and parts[1] in MOODS:
-            chat["mood"] = parts[1]
+    if cmd == "/mood":
+        mood_arg = args.split()[0].lower() if args else ""
+        if mood_arg in MOODS:
+            chat["mood"] = mood_arg
             replies = {
-                "chill": "пон вернулся на чилл че надо?",
-                "agro": "завалите ебальники я злой теперь",
-                "nerd": "режим душнилы запущен жду ваших примитивных вопросов",
-                "senior": "ладно включаю режим уставшего сеньора"
+                "chill": "ща на чилле го",
+                "agro": "завали ебало щас злой буду",
+                "nerd": "ок включаю мозги по полной",
+                "senior": "ладно режим деда втыкаю"
             }
-            await send_message(chat_id, replies[parts[1]])
+            await send_message(chat_id, replies[mood_arg])
         else:
-            await send_message(chat_id, "выбери: /mood chill | /mood agro | /mood nerd | /mood senior")
+            await send_message(chat_id, "че за настрой выбирай: chill agro nerd senior")
+        return {"status": "ok"}
+
+    # ═══════ /reset ═══════
+    if cmd == "/reset":
+        chat["history"] = []
+        await send_message(chat_id, "ок забыл всё че было")
         return {"status": "ok"}
 
     # ═══════ /status ═══════
-    if text.startswith("/status"):
-        lines = ["📊 статус системы:", ""]
-        lines.append(f"текстовая модель: {chat.get('text_model', DEFAULT_TEXT_MODEL)}")
-        lines.append(f"image модель: {chat.get('image_model', DEFAULT_IMAGE_MODEL)}")
-        lines.append(f"настроение: {chat.get('mood', 'senior')}")
-        lines.append("")
-        lines.append("провайдеры:")
+    if cmd == "/status":
+        lines = [
+            f"текст {chat.get('text_model', DEFAULT_TEXT_MODEL)}",
+            f"картинки {chat.get('image_model', DEFAULT_IMAGE_MODEL)}",
+            f"настрой {chat.get('mood', 'chill')}",
+            "",
+            "провайдеры:"
+        ]
         for provider, status in PROVIDER_STATUS.items():
             emoji = "✅" if not status.is_disabled else "❌"
-            lines.append(f"{emoji} {provider.value} (failures: {status.failures})")
+            lines.append(f"{emoji} {provider.value}")
         await send_message(chat_id, "\n".join(lines))
         return {"status": "ok"}
 
     # ═══════ /help ═══════
-    if text.startswith("/help"):
-        help_text = """команды:
+    if cmd == "/help":
+        await send_message(chat_id, """че умею:
 
-/img [описание] — сгенерить картинку
-/imgmodel — выбрать модель для картинок (flux nanobanana turbo и др)
-/provider — выбрать текстового провайдера
+/img описание — кидаю картинку
+/imgmodel — выбрать модель картинок
+/provider — выбрать модель текста
 /mood — настроение (chill agro nerd senior)
-/status — статус системы
+/reset — забыть историю
+/status — что щас стоит
 
-просто пиши и я отвечу"""
-        await send_message(chat_id, help_text)
+ну и просто пиши че надо""")
         return {"status": "ok"}
 
     # ═══════ /start ═══════
-    if text.startswith("/start"):
-        ai_text = f"о ку {user_name.lower()} я orienai v2 умею генерить картинки через /img пиши /help для команд"
-        await send_message(chat_id, ai_text)
+    if cmd == "/start":
+        await send_message(chat_id, f"оо здарова {user_name.lower()} го общаться или картинки кидать /help если че")
+        return {"status": "ok"}
+
+    # ═══════ левая команда — игнор ═══════
+    if cmd is not None:
         return {"status": "ok"}
 
     # ═══════ обычный ответ ═══════
@@ -582,7 +645,7 @@ async def webhook(request: Request):
 async def root():
     return {
         "status": "alive",
-        "version": "2.1",
+        "version": "2.2",
         "image_models": list(IMAGE_MODELS.keys()),
         "text_providers": list(PROVIDER_TO_TEXT_MODEL.keys())
     }
@@ -590,4 +653,10 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"healthy": True}
+    return {
+        "healthy": True,
+        "providers": {
+            p.value: {"active": not s.is_disabled, "failures": s.failures}
+            for p, s in PROVIDER_STATUS.items()
+        }
+    }
