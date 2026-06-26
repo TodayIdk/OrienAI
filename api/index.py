@@ -661,17 +661,26 @@ def settings_kb(s):
         [{"text": "🗑 Сбросить историю", "callback_data": "s_rh"}],
     ]}
 
-# ══════════════════════════════════════════════════════════════════════════════
-# RESPONSE LOGIC
-# ══════════════════════════════════════════════════════════════════════════════
 def should_respond(msg, s):
     if not s.get("auto_reply", True): return False
+    
+    # Игнорим самого себя и других ботов (если только не reply на нашего бота)
+    sender = msg.get("from", {})
+    if sender.get("is_bot") and sender.get("username", "").lower() != BOT_USERNAME:
+        # Это другой бот — игнор
+        return False
+    
     if msg["chat"]["type"] == "private": return True
+    
     text = (msg.get("text") or msg.get("caption") or "").lower()
     triggers = ["ориен", "orien", "ориенаи", "orienai", "ии", "эй бот", "бот", "ориэн", f"@{BOT_USERNAME}"]
     if any(t in text for t in triggers): return True
+    
     rr = msg.get("reply_to_message")
-    if rr and rr.get("from", {}).get("is_bot"): return True
+    if rr and rr.get("from", {}).get("is_bot"):
+        if rr.get("from", {}).get("username", "").lower() == BOT_USERNAME:
+            return True
+    
     return False
 
 async def ai_response(cid, uname, umsg, img=None, creator=False, friend=False):
@@ -775,17 +784,26 @@ async def webhook(req: Request):
         await handle_cb(data["callback_query"])
         return {"status": "ok"}
 
+     # ═══════ ПОСТ В КАНАЛЕ ═══════
     if "channel_post" in data:
         p = data["channel_post"]
         cid = p["chat"]["id"]
         c = chat_data(cid)
         if c["settings"].get("comment_posts"):
             t = p.get("text", "") or p.get("caption", "")
-            if t and len(t) > 10:
+            if t and len(t) > 5:
                 await typing(cid)
-                await send(cid, await ai_response(cid, "пост", t))
+                # Имитируем что пост от "канала"
+                channel_name = p["chat"].get("title", "канал")
+                comment = await ai_response(cid, channel_name, t, creator=False, friend=False)
+                # Отвечаем реплаем на сам пост
+                await tg("sendMessage", {
+                    "chat_id": cid,
+                    "text": comment,
+                    "reply_to_message_id": p.get("message_id")
+                })
         return {"status": "ok"}
-
+        
     if "message" not in data: return {"status": "ok"}
 
     msg = data["message"]
@@ -796,6 +814,28 @@ async def webhook(req: Request):
     uid = user.get("id", 0)
     c = chat_data(cid)
     s = c["settings"]
+
+        # ═══════ АВТО-КОММЕНТ ПОСТА В ЧАТЕ ОБСУЖДЕНИЙ ═══════
+    # Когда пост из канала автоматически форвардится в привязанный чат,
+    # он приходит как обычное сообщение с sender_chat = канал
+    is_channel_post_forward = (
+        msg.get("sender_chat", {}).get("type") == "channel"
+        and msg.get("is_automatic_forward", False)
+    )
+    
+    if is_channel_post_forward and s.get("comment_posts", True):
+        post_text = msg.get("text") or msg.get("caption") or ""
+        if post_text and len(post_text) > 5:
+            await typing(cid)
+            channel_name = msg["sender_chat"].get("title", "канал")
+            comment = await ai_response(cid, channel_name, post_text)
+            # Отвечаем реплаем на форварднутый пост
+            await tg("sendMessage", {
+                "chat_id": cid,
+                "text": comment,
+                "reply_to_message_id": msg.get("message_id")
+            })
+        return {"status": "ok"}
 
     if text: upd_profile(cid, uid, uname, text)
     if s.get("mute_users") and uid in s.get("muted_list", []):
