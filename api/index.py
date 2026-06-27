@@ -1914,6 +1914,10 @@ async def root():
     return {"status": "alive", "version": "7.5", "db": "connected" if DB is not None else "off",
             "pil": HAS_PIL, "stickers": len(STICKERS)}
 
+
+from mangum import Mangum
+handler = Mangum(app, lifespan="off")
+
 @app.get("/health")
 async def health():
     return {"ok": True, "db": DB is not None, "pil": HAS_PIL,
