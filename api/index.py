@@ -1768,7 +1768,6 @@ async def webhook(req: Request):
     if cmd in ("/8ball","/ball","/шар"):
         if not args: await send(cid,"`/8ball вопрос`"); return {"status": "ok"}
         await send(cid, f"{args}\n\n*{random.choice(BALL_A)}*"); return {"status": "ok"}
-
     if cmd in ("/random","/rand"):
         try:
             p = args.split() if args else ["100"]
@@ -1777,7 +1776,7 @@ async def webhook(req: Request):
         except: await send(cid,"`/random 100` или `/random 1 50`")
         return {"status": "ok"}
 
-        if cmd in ("/coin","/монетка"):
+    if cmd in ("/coin","/монетка"):
         await send(cid, f"*{random.choice(['орёл','решка'])}*"); return {"status": "ok"}
         
     if cmd in ("/choose","/выбери"):
@@ -1914,12 +1913,11 @@ async def root():
     return {"status": "alive", "version": "7.5", "db": "connected" if DB is not None else "off",
             "pil": HAS_PIL, "stickers": len(STICKERS)}
 
-
-from mangum import Mangum
-handler = Mangum(app, lifespan="off")
-
 @app.get("/health")
 async def health():
     return {"ok": True, "db": DB is not None, "pil": HAS_PIL,
             "log_chats": len(CHAT_LOG), "tracked_msgs": sum(len(v) for v in CHAT_LOG.values()),
             "stickers": len(STICKERS)}
+
+from mangum import Mangum
+handler = Mangum(app, lifespan="off")
