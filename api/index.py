@@ -385,7 +385,7 @@ async def log_message(cid, uid, name, text):
     if not text or len(text) < 2: return
     CHAT_LOG.setdefault(cid, []).append({"uid":uid,"name":name,"text":text[:200],"ts":int(time.time())})
     if len(CHAT_LOG[cid]) > MAX_LOG: CHAT_LOG[cid] = CHAT_LOG[cid][-MAX_LOG:]
-    if DB and len(CHAT_LOG[cid]) % 5 == 0:
+    if DB is not None and len(CHAT_LOG[cid]) % 5 == 0:
         try: await DB.chatlog.update_one({"chat_id":cid},{"$set":{"chat_id":cid,"log":CHAT_LOG[cid]}},upsert=True)
         except: pass
 
@@ -881,7 +881,7 @@ async def download_image(url):
     except: return None, None
 
 async def save_stickers_to_db():
-    if DB: 
+    if DB is not None: 
         try: await DB.bot_config.update_one({"key":"stickers"},{"$set":{"key":"stickers","stickers":STICKERS}},upsert=True)
         except: pass
 
@@ -1856,7 +1856,7 @@ async def webhook(req: Request):
                  f"стикеров: *{len(STICKERS)}/4*",
                  f"фактов о тебе: *{len(USER_MEMORY.get(uid,[]))}*",
                  f"чат-лог: *{len(CHAT_LOG.get(cid,[]))}*",
-                 f"бд: {'ok' if DB else 'no'} PIL: {'ok' if HAS_PIL else 'no'} TTS: {'ok' if HAS_TTS else 'no'}"]
+                 f"бд: {'ok' if DB is not None else 'no'} PIL: {'ok' if HAS_PIL else 'no'} TTS: {'ok' if HAS_TTS else 'no'}"]
         await send(cid,"\n".join(lines)); return {"status":"ok"}
 
     if cmd in ("/creator","/owner"): await send(cid, f"@{CREATOR_USERNAME}"); return {"status":"ok"}
@@ -2121,7 +2121,7 @@ v8.0: STT (голосовые) + память + мафия""")
 
 @app.get("/")
 async def root():
-    return {"status":"alive","version":"8.0","db":"ok" if DB else "off",
+    return {"status":"alive","version":"8.0","db":"ok" if DB is not None else "off",
             "pil":HAS_PIL,"tts":HAS_TTS,"stickers":len(STICKERS),"memory":len(USER_MEMORY)}
 
 @app.get("/health")
