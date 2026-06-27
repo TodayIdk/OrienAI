@@ -1777,9 +1777,9 @@ async def webhook(req: Request):
         except: await send(cid,"`/random 100` или `/random 1 50`")
         return {"status": "ok"}
 
-    if cmd in ("/coin","/монетка"):
-        await send(cid, f"*{random.choice(['орёл','решка']}*"); return {"status": "ok"}
-
+        if cmd in ("/coin","/монетка"):
+        await send(cid, f"*{random.choice(['орёл','решка'])}*"); return {"status": "ok"}
+        
     if cmd in ("/choose","/выбери"):
         if not args or "," not in args: await send(cid,"`/choose а, б, в`"); return {"status": "ok"}
         await send(cid, f"*{random.choice([o.strip() for o in args.split(',') if o.strip()])}*")
