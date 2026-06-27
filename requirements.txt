@@ -4,3 +4,4 @@ httpx[http2]
 motor
 Pillow
 python-multipart
+mangum
