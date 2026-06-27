@@ -508,7 +508,7 @@ async def web_page_text(url, max_chars=3000):
 
 # ══ AI ══
 class AI:
-    async def text(self, msgs, pref="primary", vis=False, max_tokens=None, temperature=50):
+    async def text(self, msgs, pref="primary", vis=False, max_tokens=None, temperature=0.1):
         cands = [(k,v) for k,v in TEXT_MODELS.items() if (not vis) or v.vision]
         if not cands: return "нет моделей"
         cands.sort(key=lambda x: (x[0]!=pref, x[1].pri))
@@ -585,7 +585,7 @@ class AI:
             {"role":"system","content":"отвечаешь по результатам поиска. по-русски, маленькими, без эмодзи\n"
                 "указывай [1] [2] как ссылки на источники\n*жирный* для фактов"},
             {"role":"user","content":f"запрос: {query}\n{user_context}\n\nрезультаты:\n{search_ctx}"}
-        ], pref="primary", max_tokens=1500, temperature=0.5)
+        ], pref="primary", max_tokens=1500, temperature=0.1)
         return f"{answer}\n\n_источники:_\n" + "\n".join(sources[:3])
 
     async def check_file_safety(self, content, filename):
@@ -603,14 +603,14 @@ class AI:
         ctx = "код" if ext in {".py",".js",".ts",".c",".cpp",".go",".rs",".java",".rb",".php",".sh",".html",".css"} else "файл"
         return await self.text([{"role":"system","content":f"анализ {ctx}. баги, улучшения, оценка X/10. без эмодзи"},
             {"role":"user","content":f"`{filename}`\n{user_query or 'проанализируй'}\n```\n{content}\n```"}],
-            pref="primary", temperature=0.4)
+            pref="primary", temperature=0.1)
 
     async def enhance_prompt(self, prompt, self_portrait=False):
         sys_msg = "английский промпт для Flux. ОДНА строка, макс 100 слов, hyperdetailed 4k masterpiece"
         if self_portrait: sys_msg += f"\nперсонаж: {ORIEN_DESC}"
         try:
             r = await self.text([{"role":"system","content":sys_msg},
-                {"role":"user","content":f"идея: {prompt}"}],pref="primary",max_tokens=300,temperature=0.8)
+                {"role":"user","content":f"идея: {prompt}"}],pref="primary",max_tokens=300,temperature=0.1)
             c = r.strip().strip('"\'').split("\n")[0]
             for p in ["here's","prompt:","sure,"]:
                 if c.lower().startswith(p): c = c[len(p):].strip(": ")
@@ -637,7 +637,7 @@ class AI:
     async def analyze_code(self, code, tasks):
         t = ("\nзадачи:\n"+"\n".join(f"- {x}" for x in tasks)) if tasks else ""
         return await self.text([{"role":"system","content":"code review. *ОБЗОР* *ПРОБЛЕМЫ* *ОЦЕНКА* X/10. без эмодзи"+t},
-            {"role":"user","content":f"```\n{code}\n```"}],pref="primary",temperature=0.4)
+            {"role":"user","content":f"```\n{code}\n```"}],pref="primary",temperature=0.1)
 
     async def detect_intent(self, text, has_image=False):
         try:
@@ -661,7 +661,7 @@ class AI:
                 '{"question":"вопрос","answer":"правильный","options":["вариант1","вариант2","вариант3","правильный"]}\n'
                 "перемешай варианты. ТОЛЬКО JSON"},
                 {"role":"user","content":f"тема: {topic or 'любая'}"}],
-                pref="primary",max_tokens=200,temperature=0.9)
+                pref="primary",max_tokens=200,temperature=0.1)
             r = r.strip()
             if r.startswith("```"): r = re.sub(r'^```\w*\n?','',r); r = re.sub(r'\n?```$','',r).strip()
             return json.loads(r)
@@ -687,7 +687,7 @@ class AI:
         if not text or len(text) < 10: return text
         try:
             return (await self.text([{"role":"system","content":"перепиши фальшивый текст нормально. маленькие буквы. ТОЛЬКО ТЕКСТ"},
-                {"role":"user","content":text}],pref="primary",max_tokens=500,temperature=0.5)).strip()
+                {"role":"user","content":text}],pref="primary",max_tokens=500,temperature=0.1)).strip()
         except: return text
 
 ai = AI()
@@ -889,7 +889,7 @@ async def detect_emotion(text):
     if not text or len(text)<5 or not STICKERS: return None
     try:
         r = await ai.text([{"role":"system","content":"эмоция: happy/angry/neutral/sad/none. ОДНО СЛОВО"},
-            {"role":"user","content":text[:300]}],pref="fallback_free",max_tokens=10,temperature=0.3)
+            {"role":"user","content":text[:300]}],pref="fallback_free",max_tokens=10,temperature=0.1)
         e = r.strip().lower().strip('".,!?\n')
         return e if e in ("happy","angry","neutral","sad") else None
     except: return None
@@ -1028,7 +1028,7 @@ async def ai_response(cid, uname, umsg, img=None, creator=False, friend=False, u
         if not pc or not pc.vision:
             for k,v in TEXT_MODELS.items():
                 if v.vision: pref = k; break
-    raw = await ai.text(msgs, pref=pref, vis=img is not None, temperature=0.85)
+    raw = await ai.text(msgs, pref=pref, vis=img is not None, temperature=0.1)
     at = fmt(raw)
     if use_anticringe and len(at) > 15 and detect_cringe(at):
         imp = await ai.anticringe(at)
@@ -1260,7 +1260,7 @@ async def h_cities(cid, uid, uname, args):
             f"запрещены: {', '.join(list(g['used'])[-20:])}\n"
             "если не можешь вспомнить — напиши 'сдаюсь'"},
             {"role":"user","content":f"город на букву {last_char.upper()}"}],
-            pref="primary", max_tokens=30, temperature=0.8)
+            pref="primary", max_tokens=30, temperature=0.1)
         bot_city = r.strip().lower().split()[0] if r else "сдаюсь"
         bot_city = re.sub(r'[^а-яa-z]','',bot_city)
         if bot_city in g["used"] or "сдаюсь" in bot_city or not bot_city:
@@ -1371,7 +1371,7 @@ async def generate_chat_fact(cid):
     try:
         r = await ai.text([{"role":"system","content":"аналитик чата. без эмодзи"},
             {"role":"user","content":f"актив: {', '.join(f'{n}({c})' for n,c in top)}\n\n{recent}\n\n2-3 строки *жирный* для имён"}],
-            pref="primary",max_tokens=300,temperature=0.8)
+            pref="primary",max_tokens=300,temperature=0.1)
         return fmt(r)
     except: return "err"
 
@@ -1989,7 +1989,7 @@ async def webhook(req: Request):
         ms = "\n".join(pr.get("messages",[])[-10:]) if pr else "нет"
         await typing(cid)
         r = await ai.text([{"role":"system","content":"прожарь 2-3 строки без эмодзи"},
-            {"role":"user","content":f"{tname}:\n{ms}"}],pref="primary",temperature=0.9)
+            {"role":"user","content":f"{tname}:\n{ms}"}],pref="primary",temperature=0.1)
         await send(cid, f"*{tname}*:\n{fmt(r)}"); return {"status":"ok"}
 
     if cmd == "/ship":
@@ -2039,7 +2039,7 @@ async def webhook(req: Request):
     if cmd in ("/quote","/цитата"):
         await typing(cid)
         q = await ai.text([{"role":"system","content":"дерзкая цитата 1-2 строки без эмодзи"},
-            {"role":"user","content":"цитату"}],pref="primary",temperature=0.9)
+            {"role":"user","content":"цитату"}],pref="primary",temperature=0.1)
         await send(cid, f"«_{fmt(q)}_»\n— *OrienAI*"); return {"status":"ok"}
 
     # ═══ HELP ═══
