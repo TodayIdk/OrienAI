@@ -508,7 +508,7 @@ async def web_page_text(url, max_chars=3000):
 
 # ══ AI ══
 class AI:
-    async def text(self, msgs, pref="primary", vis=False, max_tokens=None, temperature=0.9):
+    async def text(self, msgs, pref="primary", vis=False, max_tokens=None, temperature=50):
         cands = [(k,v) for k,v in TEXT_MODELS.items() if (not vis) or v.vision]
         if not cands: return "нет моделей"
         cands.sort(key=lambda x: (x[0]!=pref, x[1].pri))
