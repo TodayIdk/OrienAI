@@ -1,8 +1,6 @@
 fastapi
-uvicorn
-httpx[http2]
+httpx
 motor
-Pillow
-python-multipart
-mangum
+pillow
 edge-tts
+mangum
