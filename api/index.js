@@ -208,7 +208,7 @@ export default async function handler(req, res) {
           ...history,
           { role: "user", content: userText }
         ],
-        temperature: 0.85,
+        temperature: 1,
         max_tokens: 70
       })
     });
