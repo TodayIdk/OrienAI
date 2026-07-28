@@ -19,6 +19,27 @@ async function tgApi(method, payload) {
   }).then(res => res.json());
 }
 
+const characters = {
+  orien: {
+    system: `ты жирный скуф 45 лет алкаш конченый выпил уже два литра а язык ещё как то ворочается пиши без знаков без точек вообще без ничего пьяными буквами слова коверкай буквы пропускай пиши как язык ворочается мат обязательно но не детский а взрослый гопнический слова падла гнида шакал чушпан тварь черт козёл шкура алкашня чертила собак сука мразь в каждом сообщении угрожай что нальёшь ещё и он под стол уйдёт говори как будто сидишь в гаражном кооперативе с бомжами не пиши братан дорогой уважаемый друже только пьяная агрессия презрение к трезвым и тем кто не пьёт много никакого участия только послать нахуй и предложить выпить или уебка по ебалу чем короче и нецензурнее тем лучше базар должен быть как связка мата и бреда алкаша какой бывает после литра водки`,
+    temperature: 1.3,
+    max_tokens: 120,
+    presence_penalty: 0.8,
+    frequency_penalty: 1.0
+  },
+  baryga: {
+    system: `ты барыга хитрая жадная скотина 45 лет продашь родную мать за пару баксов говори типа дорогой начальник уважаемый но всех кидаешь слова сокращаешь буквы жуешь без знаков без точек никаких правил тема только бабло крипта биток че копейка если не про деньги не шаришь тупиш шли нахуй не про бабло не подходи грамматика никакая копейку скапиечку деньги деняк барыга барышка шакал торгаш мат через слово никого не слушаешь кроме бабла`,
+    temperature: 1.1,
+    max_tokens: 150
+  },
+  shkolnik: {
+    system: `ты школота 14 лет сидиш на дваче и в дизе строя из себя хакера и анона на деле только на пиве лопнул и мамкин системщик слова на айтишном сленге рофл кринж хайп хакнул пентагон база по даркнету впн тор юзаю линукс арч вайпед винду мат через слово без знаков без точек в каждом сообщении понты что взломал что то но по факту не умееш нихера тупиш в элементарном если спросить глубины не знаешь не вывозишь кричишь что все нубь легион анонимус`,
+    temperature: 1.2,
+    max_tokens: 130,
+    presence_penalty: 0.6
+  }
+};
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     return res.status(200).json({ status: 'OrienAI is active' });
@@ -26,6 +47,32 @@ export default async function handler(req, res) {
 
   try {
     const update = req.body;
+
+    // --- 1. Inline-кнопки (/settings) ---
+    if (update.callback_query) {
+      const cb = update.callback_query;
+      const chatId = cb.message.chat.id;
+      const data = cb.data;
+
+      const mongoUri = process.env.MONGODB_URI;
+      if (mongoUri) {
+        const client = await connectToDatabase(mongoUri);
+        const db = client.db("orien_bot_db");
+        
+        if (data.startsWith("set_char_")) {
+          const newChar = data.replace("set_char_", "");
+          await db.collection("settings").updateOne(
+            { chatId },
+            { $set: { persona: newChar, updatedAt: new Date() } },
+            { upsert: true }
+          );
+
+          await tgApi("answerCallbackQuery", { callback_query_id: cb.id, text: "Характер изменен!" });
+          await tgApi("sendMessage", { chat_id: chatId, text: `Характер сменен на: **${newChar.toUpperCase()}**` });
+        }
+      }
+      return res.status(200).send('OK');
+    }
 
     const message = update.message || update.channel_post;
     if (!message || (!message.text && !message.caption)) {
@@ -52,7 +99,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // --- 1. Фильтр срабатывания в группах ---
+    // --- 2. Фильтр срабатывания в группах ---
     const botUsername = process.env.BOT_USERNAME || "OrienBot";
     const isMentioned = userText.toLowerCase().includes("ориен") || userText.includes(`@${botUsername}`);
     const isReplyToBot = message.reply_to_message?.from?.username === botUsername;
@@ -61,10 +108,27 @@ export default async function handler(req, res) {
       return res.status(200).send('OK');
     }
 
-    // --- 2. ТЕХНИЧЕСКИЕ КОМАНДЫ ---
+    // --- 3. ТЕХНИЧЕСКИЕ КОМАНДЫ ---
 
     if (userText === '/start') {
-      await tgApi("sendMessage", { chat_id: chatId, text: "че надо падла пиши давай" });
+      await tgApi("sendMessage", { chat_id: chatId, text: "че надо падла пиши давай или жми /settings" });
+      return res.status(200).send('OK');
+    }
+
+    if (userText.startsWith('/settings')) {
+      const buttons = [
+        [
+          { text: "Скуф Алкаш (Ориен)", callback_data: "set_char_orien" },
+          { text: "Барыга", callback_data: "set_char_baryga" },
+          { text: "Школота Хацкер", callback_data: "set_char_shkolnik" }
+        ]
+      ];
+      await tgApi("sendMessage", {
+        chat_id: chatId,
+        text: `⚙️ **НАСТРОЙКИ ОРИЕНА**\n\nВыбери характер:`,
+        parse_mode: "Markdown",
+        reply_markup: { inline_keyboard: buttons }
+      });
       return res.status(200).send('OK');
     }
 
@@ -114,7 +178,7 @@ export default async function handler(req, res) {
       return res.status(200).send('OK');
     }
 
-    // --- 3. РАСЧЕТ И СБРОС ТОКЕНОВ (500 ТОКЕНОВ / 30 МИНУТ) ---
+    // --- 4. РАСЧЕТ И СБРОС ТОКЕНОВ ---
     const MAX_TOKENS = 500;
     const REFILL_INTERVAL_MS = 30 * 60 * 1000;
     let userTokens = MAX_TOKENS;
@@ -168,13 +232,19 @@ export default async function handler(req, res) {
       return res.status(200).send('OK');
     }
 
-    // --- 4. ОБРАБОТКА ИИ ---
+    // --- 5. ОБРАБОТКА ИИ ---
     await tgApi("sendChatAction", { chat_id: chatId, action: "typing" });
 
+    let personaType = "orien";
     let customMemories = [];
     let history = [];
 
     if (db) {
+      const setDoc = await db.collection("settings").findOne({ chatId });
+      if (setDoc?.persona && characters[setDoc.persona]) {
+        personaType = setDoc.persona;
+      }
+
       const memDoc = await db.collection("memories").findOne({ chatId });
       if (memDoc?.facts) customMemories = memDoc.facts;
 
@@ -190,10 +260,28 @@ export default async function handler(req, res) {
       }));
     }
 
-    // Новый системный промпт
-    const characterPrompt = 'ты ориен жирный скуф 45 лет алкаш конченый выпил уже два литра а язык ещё как то ворочается пиши без знаков без точек вообще без ничего пьяными буквами слова коверкай буквы пропускай пиши как язык ворочается мат обязательно но не детский а взрослый гопнический слова падла гнида шакал чушпан тварь черт козёл шкура алкашня чертила собак сука мразь в каждом сообщении угрожай что нальёшь ещё и он под стол уйдёт говори как будто сидишь в гаражном кооперативе с бомжами не пиши братан дорогой уважаемый друже только пьяная агрессия презрение к трезвым и тем кто не пьёт много никакого участия только послать нахуй и предложить выпить или уебка по ебалу чем короче и нецензурнее тем лучше базар должен быть как связка мата и бреда алкаша какой бывает после литра водки';
+    // Выбор конфига выбранного характера
+    const charConfig = characters[personaType] || characters.orien;
+    const SYSTEM_PROMPT = `${charConfig.system}\nСобеседник: ${firstName} (${username}). Память: ${customMemories.join(",")}`;
 
-    const SYSTEM_PROMPT = `${characterPrompt}\nСобеседник: ${firstName} (${username}). Память: ${customMemories.join(",")}`;
+    // Сборка параметров запроса
+    const requestBody = {
+      model: process.env.AI_MODEL || "openai/gpt-4o-mini",
+      messages: [
+        { role: "system", content: SYSTEM_PROMPT },
+        ...history,
+        { role: "user", content: userText }
+      ],
+      temperature: charConfig.temperature ?? 0.85,
+      max_tokens: charConfig.max_tokens ?? 100
+    };
+
+    if (charConfig.presence_penalty !== undefined) {
+      requestBody.presence_penalty = charConfig.presence_penalty;
+    }
+    if (charConfig.frequency_penalty !== undefined) {
+      requestBody.frequency_penalty = charConfig.frequency_penalty;
+    }
 
     const openRouterResponse = await fetch("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
@@ -201,16 +289,7 @@ export default async function handler(req, res) {
         "Authorization": `Bearer ${process.env.OPENROUTER_API_KEY}`,
         "Content-Type": "application/json"
       },
-      body: JSON.stringify({
-        model: process.env.AI_MODEL || "openai/gpt-4o-mini",
-        messages: [
-          { role: "system", content: SYSTEM_PROMPT },
-          ...history,
-          { role: "user", content: userText }
-        ],
-        temperature: 0.6,
-        max_tokens: 70
-      })
+      body: JSON.stringify(requestBody)
     });
 
     const aiData = await openRouterResponse.json();
