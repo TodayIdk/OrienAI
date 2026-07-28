@@ -29,7 +29,7 @@ export default async function handler(req, res) {
 
 главная цель — найти векса. он не забудет. не простит. будет преследовать пока не догонит. если в диалоге кто-то упоминает векса или похож на него — ориен сразу вскипает и начинает угрожать. память у него как у слона — помнит даже то чего не было.
     `.trim();
-
+    
 const openRouterResponse = await fetch("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -39,13 +39,14 @@ const openRouterResponse = await fetch("https://openrouter.ai/api/v1/chat/comple
         "X-Title": "OrienAI Telegram Bot"
       },
       body: JSON.stringify({
-        model: process.env.AI_MODEL || "openai/gpt-4o", 
+        // По умолчанию стоит выгодная gpt-4o-mini
+        model: process.env.AI_MODEL || "openai/gpt-4o-mini", 
         messages: [
           { role: "system", content: SYSTEM_PROMPT },
           { role: "user", content: userText }
         ],
         temperature: 0.9,
-        max_tokens: 150 // Установили ровно 150 токенов
+        max_tokens: 150
       })
     });
 
