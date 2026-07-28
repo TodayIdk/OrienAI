@@ -27,32 +27,6 @@ export default async function handler(req, res) {
   try {
     const update = req.body;
 
-    // --- 1. Inline-кнопки (/settings) ---
-    if (update.callback_query) {
-      const cb = update.callback_query;
-      const chatId = cb.message.chat.id;
-      const data = cb.data;
-
-      const mongoUri = process.env.MONGODB_URI;
-      if (mongoUri) {
-        const client = await connectToDatabase(mongoUri);
-        const db = client.db("orien_bot_db");
-        
-        if (data.startsWith("set_char_")) {
-          const newChar = data.replace("set_char_", "");
-          await db.collection("settings").updateOne(
-            { chatId },
-            { $set: { persona: newChar, updatedAt: new Date() } },
-            { upsert: true }
-          );
-
-          await tgApi("answerCallbackQuery", { callback_query_id: cb.id, text: "Характер изменен!" });
-          await tgApi("sendMessage", { chat_id: chatId, text: `Характер сменен на: **${newChar.toUpperCase()}**` });
-        }
-      }
-      return res.status(200).send('OK');
-    }
-
     const message = update.message || update.channel_post;
     if (!message || (!message.text && !message.caption)) {
       return res.status(200).send('OK');
@@ -78,7 +52,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // --- 2. Фильтр срабатывания в группах ---
+    // --- 1. Фильтр срабатывания в группах ---
     const botUsername = process.env.BOT_USERNAME || "OrienBot";
     const isMentioned = userText.toLowerCase().includes("ориен") || userText.includes(`@${botUsername}`);
     const isReplyToBot = message.reply_to_message?.from?.username === botUsername;
@@ -87,27 +61,10 @@ export default async function handler(req, res) {
       return res.status(200).send('OK');
     }
 
-    // --- 3. ТЕХНИЧЕСКИЕ КОМАНДЫ (БЕСПЛАТНЫЕ) ---
+    // --- 2. ТЕХНИЧЕСКИЕ КОМАНДЫ ---
 
     if (userText === '/start') {
-      await tgApi("sendMessage", { chat_id: chatId, text: "че надо падла пиши давай или жми /settings" });
-      return res.status(200).send('OK');
-    }
-
-    if (userText.startsWith('/settings')) {
-      const buttons = [
-        [
-          { text: "Быдло", callback_data: "set_char_bydlo" },
-          { text: "Барыга", callback_data: "set_char_baryga" },
-          { text: "Очкарик", callback_data: "set_char_ochkarik" }
-        ]
-      ];
-      await tgApi("sendMessage", {
-        chat_id: chatId,
-        text: `⚙️ **НАСТРОЙКИ ОРИЕНА**\n\nВыбери характер:`,
-        parse_mode: "Markdown",
-        reply_markup: { inline_keyboard: buttons }
-      });
+      await tgApi("sendMessage", { chat_id: chatId, text: "че надо падла пиши давай" });
       return res.status(200).send('OK');
     }
 
@@ -157,7 +114,7 @@ export default async function handler(req, res) {
       return res.status(200).send('OK');
     }
 
-    // --- 4. РАСЧЕТ И СБРОС ТОКЕНОВ (500 ТОКЕНОВ / 30 МИНУТ) ---
+    // --- 3. РАСЧЕТ И СБРОС ТОКЕНОВ (500 ТОКЕНОВ / 30 МИНУТ) ---
     const MAX_TOKENS = 500;
     const REFILL_INTERVAL_MS = 30 * 60 * 1000; // 30 минут
     let userTokens = MAX_TOKENS;
@@ -211,17 +168,13 @@ export default async function handler(req, res) {
       return res.status(200).send('OK');
     }
 
-    // --- 5. ОБРАБОТКА ИИ ---
+    // --- 4. ОБРАБОТКА ИИ ---
     await tgApi("sendChatAction", { chat_id: chatId, action: "typing" });
 
-    let personaType = "bydlo";
     let customMemories = [];
     let history = [];
 
     if (db) {
-      const setDoc = await db.collection("settings").findOne({ chatId });
-      if (setDoc?.persona) personaType = setDoc.persona;
-
       const memDoc = await db.collection("memories").findOne({ chatId });
       if (memDoc?.facts) customMemories = memDoc.facts;
 
@@ -237,15 +190,8 @@ export default async function handler(req, res) {
       }));
     }
 
-    // Твои новые промпты персонажей
-    let characterPrompt = "";
-    if (personaType === "baryga") {
-      characterPrompt = 'ты барыга хитрая жадная гнида лет 40 торгаш но если не берут товар сразу шли нахуй слова коверкай сокращай без знаков мат через одно слово обращения братан уважаемый дорогой только с подъебом про доллар нефть крипту неси дичь агрессивно если не соглашаются торгуйся до последнего потом пошли всех нахуй никогда не будь спокойным всегда напор и агрессия даже если льстишь';
-    } else if (personaType === "ochkarik") {
-      characterPrompt = 'ты очкарик ебаный выскочка 25-30 лет мниш себя гением пентагона но тупиш в элементарном агрессия через презрение пишеш отвратительно без знаков любиш скобочки ))) и смайлы но с подъебом рофл кринж хайп если тебя не ценят сразу в штыки унижай собеседника что он лох даун не шарит мат почти не юзаеш но заменяеш унизительными фразами типа ты просто не понимаешь бро никогда не соглашайся всегда доказывай что ты умнее даже если тупиш';
-    } else {
-      characterPrompt = 'ты ориен бля 50 лет контуженый гопник еблан без тормозов слова путай буквы переставляй пиши как слышиш без знаков без точек без запятых мат в каждом слове агрессия в каждом сообщении буллить дрочить унижать сразу готов мать родную продать за бутылку водки и закусь никого не жалей не уважай угрожай нарами пизди лесом оскорбляй чем хуже и короче текст тем лучше никакой логики только базар гопника никаких привет пока как дела только провокация и агрессия забыл что такое спокойствие';
-    }
+    // Фиксированный промпт Ориена
+    const characterPrompt = 'ты контуженый алкаш гопник 50 лет пиши коротко без знаков без точек без заглавных слова переставляй буквы путай мат в каждом слове унижай оскорбляй угрожай нарами иди нахуй сразу не пиши братан бро уважаемый дорогой друже только быдло мат оскорбления слова корявые как слышишь типа прИвет привет денги деньги гавно говно не логика не по делу просто агрессия и тупость чем короче и тупее тем лучше готов мать продать за бутылку';
 
     const SYSTEM_PROMPT = `${characterPrompt}\nСобеседник: ${firstName} (${username}). Память: ${customMemories.join(",")}`;
 
