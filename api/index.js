@@ -132,7 +132,7 @@ export default async function handler(req, res) {
       const extraSystem = `ВАЖНО: сейчас с тобой в чате говорит твой сын ВЕКС. тот самый которого ты искал. реагируй как ориен — злоба, обида, воспоминания, угрозы. не игнорь.`;
       const userText = `Векс только что написал в чат: "${text}". ответь ему.`;
 
-      const replyText = await askAIForBridge(charConfig, extraSystem, userText) || 'че ты бля...';
+      const replyText = await askAIForBridge(charConfig, extraSystem, userText);
 
       await tgApi("sendMessage", { chat_id, text: replyText });
 
@@ -381,7 +381,7 @@ export default async function handler(req, res) {
     });
 
     const aiData = await openRouterResponse.json();
-    const replyText = aiData.choices?.[0]?.message?.content || "че надо бля... молчи нах";
+    const replyText = aiData.choices?.[0]?.message?.content;
 
     if (db) {
       await db.collection("user_tokens").updateOne(
