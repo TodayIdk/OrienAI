@@ -3,16 +3,18 @@ import { MongoClient } from 'mongodb';
 let cachedClient = null;
 
 async function connectToDatabase(uri) {
-  // Защита: проверяем, что uri существует, это строка и она начинается с правильного протокола
-  if (!uri || typeof uri !== 'string' || (!uri.startsWith('mongodb://') && !uri.startsWith('mongodb+srv://'))) {
-    console.error("[MongoDB Warning] MONGODB_URI не задан или имеет неверный формат!");
+  // Очищаем URI от возможных случайных кавычек и пробелов
+  const cleanUri = uri ? uri.trim().replace(/^["']|["']$/g, '') : '';
+
+  if (!cleanUri || (!cleanUri.startsWith('mongodb://') && !cleanUri.startsWith('mongodb+srv://'))) {
+    console.error("[MongoDB Warning] MONGODB_URI пустой или имеет неверный формат!");
     return null;
   }
 
   if (cachedClient) return cachedClient;
 
   try {
-    const client = new MongoClient(uri);
+    const client = new MongoClient(cleanUri);
     await client.connect();
     cachedClient = client;
     return client;
@@ -62,18 +64,18 @@ export default async function handler(req, res) {
     return res.status(200).json({ status: 'OrienAI Engine Online' });
   }
 
-  // Мгновенный ответ Telegram (prevent Vercel timeout)
+  // Мгновенный ответ Telegram (чтобы не сбрасывало по таймауту)
   res.status(200).send('OK');
 
   try {
     const mongoUri = process.env.MONGODB_URI;
     let db = null;
 
-    // Подключение к БД
     if (mongoUri) {
       const client = await connectToDatabase(mongoUri);
       if (client) {
-        db = client.db("orien_bot_db");
+        // Подключаемся к базе (берется имя из URI или по умолчанию OrienAII)
+        db = client.db();
       }
     }
 
