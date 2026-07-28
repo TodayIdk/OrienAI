@@ -3,11 +3,23 @@ import { MongoClient } from 'mongodb';
 let cachedClient = null;
 
 async function connectToDatabase(uri) {
+  // Защита: проверяем, что uri существует, это строка и она начинается с правильного протокола
+  if (!uri || typeof uri !== 'string' || (!uri.startsWith('mongodb://') && !uri.startsWith('mongodb+srv://'))) {
+    console.error("[MongoDB Warning] MONGODB_URI не задан или имеет неверный формат!");
+    return null;
+  }
+
   if (cachedClient) return cachedClient;
-  const client = new MongoClient(uri);
-  await client.connect();
-  cachedClient = client;
-  return client;
+
+  try {
+    const client = new MongoClient(uri);
+    await client.connect();
+    cachedClient = client;
+    return client;
+  } catch (err) {
+    console.error("[MongoDB Connection Error]:", err);
+    return null;
+  }
 }
 
 async function sendTelegramMessage(chatId, text, replyMarkup = null) {
@@ -26,7 +38,8 @@ function getSystemPrompt(character, fullName, username, userId, customMemory, ch
 ДАННЫЕ ТВОЕГО СОБЕСЕДНИКА:
 - Имя: ${fullName}
 - Username: ${username}
-- Telegram ID: ${userId}${chatTitle ? `- Название чата: ${chatTitle}` : ''}
+- Telegram ID: ${userId}
+${chatTitle ? `- Название чата: ${chatTitle}` : ''}
 ${channelTitle ? `- Канал, связанный с чатом: ${channelTitle}` : ''}
 ${customMemory ? `\nВАЖНОЕ ПРАВИЛО/ЗАМЕТКА О ПОЛЬЗОВАТЕЛЕ (память): "${customMemory}"` : ''}
   `.trim();
@@ -49,15 +62,19 @@ export default async function handler(req, res) {
     return res.status(200).json({ status: 'OrienAI Engine Online' });
   }
 
-  // МГНОВЕННО отвечаем серверу Telegram, чтобы он не обрывал соединение!
+  // Мгновенный ответ Telegram (prevent Vercel timeout)
   res.status(200).send('OK');
 
   try {
     const mongoUri = process.env.MONGODB_URI;
     let db = null;
+
+    // Подключение к БД
     if (mongoUri) {
       const client = await connectToDatabase(mongoUri);
-      db = client.db("orien_bot_db");
+      if (client) {
+        db = client.db("orien_bot_db");
+      }
     }
 
     // --- 1. ОБРАБОТКА НАЖАТИЙ НА КНОПКИ (CALLBACK) ---
@@ -91,7 +108,6 @@ export default async function handler(req, res) {
       return;
     }
 
-    // Достаем текстовое сообщение или пост
     const message = req.body.message || req.body.channel_post;
     if (!message) return;
 
@@ -104,18 +120,22 @@ export default async function handler(req, res) {
     const username = message.from?.username ? `@${message.from.username}` : 'нет юзернейма';
     const firstName = message.from?.first_name || 'Чувак';
     const lastName = message.from?.last_name || '';
-    const fullName = `${firstName}${lastName}`.trim();
+    const fullName = `${firstName} ${lastName}`.trim();
     const userText = message.text || '';
 
-    // Загружаем настройки чата
+    // Загрузка настроек
     let settings = { character: 'bydlo', customMemory: '', tokens: 1000 };
     if (db) {
-      const settingsCol = db.collection("chat_settings");
-      const found = await settingsCol.findOne({ chatId });
-      if (found) {
-        settings = { ...settings, ...found };
-      } else {
-        await settingsCol.insertOne({ chatId, ...settings });
+      try {
+        const settingsCol = db.collection("chat_settings");
+        const found = await settingsCol.findOne({ chatId });
+        if (found) {
+          settings = { ...settings, ...found };
+        } else {
+          await settingsCol.insertOne({ chatId, ...settings });
+        }
+      } catch (err) {
+        console.error("Error reading settings:", err);
       }
     }
 
@@ -209,16 +229,20 @@ export default async function handler(req, res) {
     // --- 5. ГЕНЕРАЦИЯ ОТВЕТА ИИ ---
     let history = [];
     if (db) {
-      const previousMessages = await db.collection("chat_history")
-        .find({ chatId })
-        .sort({ timestamp: -1 })
-        .limit(6)
-        .toArray();
+      try {
+        const previousMessages = await db.collection("chat_history")
+          .find({ chatId })
+          .sort({ timestamp: -1 })
+          .limit(6)
+          .toArray();
 
-      history = previousMessages.reverse().map(doc => ({
-        role: doc.role,
-        content: doc.content
-      }));
+        history = previousMessages.reverse().map(doc => ({
+          role: doc.role,
+          content: doc.content
+        }));
+      } catch (err) {
+        console.error("Error reading history:", err);
+      }
     }
 
     const systemPrompt = getSystemPrompt(
@@ -258,13 +282,17 @@ export default async function handler(req, res) {
     const usedTokens = aiData.usage?.total_tokens || 40;
 
     if (db) {
-      const newBalance = Math.max(0, settings.tokens - usedTokens);
-      await db.collection("chat_settings").updateOne({ chatId }, { $set: { tokens: newBalance } });
+      try {
+        const newBalance = Math.max(0, settings.tokens - usedTokens);
+        await db.collection("chat_settings").updateOne({ chatId }, { $set: { tokens: newBalance } });
 
-      await db.collection("chat_history").insertMany([
-        { chatId, userId, role: "user", content: userText, timestamp: new Date() },
-        { chatId, userId, role: "assistant", content: replyText, timestamp: new Date() }
-      ]);
+        await db.collection("chat_history").insertMany([
+          { chatId, userId, role: "user", content: userText, timestamp: new Date() },
+          { chatId, userId, role: "assistant", content: replyText, timestamp: new Date() }
+        ]);
+      } catch (err) {
+        console.error("Error saving to db:", err);
+      }
     }
 
     await sendTelegramMessage(chatId, replyText);
