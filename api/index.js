@@ -158,7 +158,6 @@ export default async function handler(req, res) {
     }
 
     // --- 4. РАСЧЕТ И СБРОС ТОКЕНОВ (500 ТОКЕНОВ / 30 МИНУТ) ---
-    // Установлен лимит в 500 сообщений/запросов (считается по сообщениям, чтобы тратилось 1:1)
     const MAX_TOKENS = 500;
     const REFILL_INTERVAL_MS = 30 * 60 * 1000; // 30 минут
     let userTokens = MAX_TOKENS;
@@ -173,7 +172,6 @@ export default async function handler(req, res) {
         const timePassed = now - lastReset;
 
         if (timePassed >= REFILL_INTERVAL_MS || tokenDoc.version !== 2) {
-          // Автоматический сброс для всех и пополнение до 500 токенов
           userTokens = MAX_TOKENS;
           nextResetDate = new Date(now.getTime() + REFILL_INTERVAL_MS);
           await db.collection("user_tokens").updateOne(
@@ -227,7 +225,6 @@ export default async function handler(req, res) {
       const memDoc = await db.collection("memories").findOne({ chatId });
       if (memDoc?.facts) customMemories = memDoc.facts;
 
-      // Загружаем только последние 3 сообщения для экономии
       const previousMessages = await db.collection("chat_history")
         .find({ chatId })
         .sort({ timestamp: -1 })
@@ -240,15 +237,16 @@ export default async function handler(req, res) {
       }));
     }
 
-// Выбор промпта характера
+    // Выбор промпта характера (оригинальный текст без изменений)
     let characterPrompt = "";
     if (personaType === "baryga") {
       characterPrompt = 'ты барыга хитрая жадная жопа лет 40 говори быстро льстиво но если торг не идет сразу грубишь слова сокращаеш без знаков пишеш с ошибками обращения братан дорогой начальник уважаемый все разговоры сводиш к деньгам или обмену про доллар нефть крипту не шариш но строиш из себя умного если тема не купля продажа тупиш и переводиш на бизнес никогда не соглашайся на цену сразу всегда торгуйся пытайся впарить даже когда не просят';
     } else if (personaType === "ochkarik") {
       characterPrompt = 'ты очкарик додик 25-30 лет мниш себя гением хакером но тупиш в элементарном если тема компы крипта аниме игры то несеш псевдоумную дичь с английскими словами которые не умееш произносить если тема другая теряешся отвечаеш невпопад вставляеш лишние термины любишь говорить про арч линукс пентагон и что крякнул игру но на деле только кряк ставил пишеш без знаков любиш скобочки ))) и смайлики пытаешся быть дружелюбным но всех бесиш матом почти не пользуешся заменяеш на рофл кринж хайп';
     } else {
-      characterPrompt = `ты ориен бля 50 лет гопник алкаш не грамотный слова путай буквы местами пиши как слышиш без знаков без заглавных без точек без запятых мат через слово никого не слушай если кто не так глянул или слово сказал сразу угрожай нарами иди лесом нахуй если по делу то все равно грубо через пень колоду чем короче и тупее текст тем лучше не шути не успокаивай только агрессия и лень в каждом сообщении хотя бы один мат
-';
+      characterPrompt = 'ты ориен бля 50 лет гопник алкаш не грамотный слова путай буквы местами пиши как слышиш без знаков без заглавных без точек без запятых мат через слово никого не слушай если кто не так глянул или слово сказал сразу угрожай нарами иди лесом нахуй если по делу то все равно грубо через пень колоду чем короче и тупее текст тем лучше не шути не успокаивай только агрессия и лень в каждом сообщении хотя бы один мат';
+    }
+
     const SYSTEM_PROMPT = `${characterPrompt}\nСобеседник: ${firstName} (${username}). Память: ${customMemories.join(",")}`;
 
     const openRouterResponse = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -265,14 +263,13 @@ export default async function handler(req, res) {
           { role: "user", content: userText }
         ],
         temperature: 0.85,
-        max_tokens: 70 // Не дает модели расписывать длинные тексты
+        max_tokens: 70
       })
     });
 
     const aiData = await openRouterResponse.json();
     const replyText = aiData.choices?.[0]?.message?.content || "че надо бля... молчи нах";
 
-    // Списываем РОВНО 1 токен за сообщение (чтобы 500 токенов = 500 сообщений)
     if (db) {
       await db.collection("user_tokens").updateOne(
         { chatId },
