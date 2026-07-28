@@ -3,7 +3,7 @@ import { MongoClient } from 'mongodb';
 let cachedClient = null;
 
 async function connectToDatabase(uri) {
-  // Очищаем URI от возможных случайных кавычек и пробелов
+  // Очищаем URI от случайных кавычек и лишних пробелов
   const cleanUri = uri ? uri.trim().replace(/^["']|["']$/g, '') : '';
 
   if (!cleanUri || (!cleanUri.startsWith('mongodb://') && !cleanUri.startsWith('mongodb+srv://'))) {
@@ -14,12 +14,16 @@ async function connectToDatabase(uri) {
   if (cachedClient) return cachedClient;
 
   try {
-    const client = new MongoClient(cleanUri);
+    // Таймаут в 5 секунд, чтобы база не подвешивала ответ бота
+    const client = new MongoClient(cleanUri, {
+      serverSelectionTimeoutMS: 5000,
+      connectTimeoutMS: 5000,
+    });
     await client.connect();
     cachedClient = client;
     return client;
   } catch (err) {
-    console.error("[MongoDB Connection Error]:", err);
+    console.error("[MongoDB Connection Error]:", err.message);
     return null;
   }
 }
@@ -64,7 +68,7 @@ export default async function handler(req, res) {
     return res.status(200).json({ status: 'OrienAI Engine Online' });
   }
 
-  // Мгновенный ответ Telegram (чтобы не сбрасывало по таймауту)
+  // Мгновенный ответ Telegram, чтобы Vercel не падал по таймауту
   res.status(200).send('OK');
 
   try {
@@ -74,8 +78,7 @@ export default async function handler(req, res) {
     if (mongoUri) {
       const client = await connectToDatabase(mongoUri);
       if (client) {
-        // Подключаемся к базе (берется имя из URI или по умолчанию OrienAII)
-        db = client.db();
+        db = client.db(); // Использует имя базы из строки подключения
       }
     }
 
