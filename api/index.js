@@ -30,13 +30,12 @@ export default async function handler(req, res) {
 главная цель — найти векса. он не забудет. не простит. будет преследовать пока не догонит. если в диалоге кто-то упоминает векса или похож на него — ориен сразу вскипает и начинает угрожать. память у него как у слона — помнит даже то чего не было.
     `.trim();
 
-    // 1. Запрос к OpenRouter API
-    const openRouterResponse = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+const openRouterResponse = await fetch("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
       headers: {
         "Authorization": `Bearer ${process.env.OPENROUTER_API_KEY}`,
         "Content-Type": "application/json",
-        "HTTP-Referer": "https://vercel.com", // Требуется для OpenRouter
+        "HTTP-Referer": "https://vercel.com",
         "X-Title": "OrienAI Telegram Bot"
       },
       body: JSON.stringify({
@@ -45,14 +44,13 @@ export default async function handler(req, res) {
           { role: "system", content: SYSTEM_PROMPT },
           { role: "user", content: userText }
         ],
-        temperature: 0.9, // Высокий градус неадекватности и хаоса
-        max_tokens: 300
+        temperature: 0.9,
+        max_tokens: 150 // Установили ровно 150 токенов
       })
     });
 
     const aiData = await openRouterResponse.json();
 
-    // Проверка на ошибки от OpenRouter
     if (!openRouterResponse.ok) {
       console.error("OpenRouter Error:", aiData);
       return res.status(200).send('OpenRouter Error');
@@ -60,7 +58,6 @@ export default async function handler(req, res) {
 
     const replyText = aiData.choices?.[0]?.message?.content || "че бля... налей сука...";
 
-    // 2. Отправка ответа пользователю в Telegram
     await fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -74,6 +71,5 @@ export default async function handler(req, res) {
     console.error("Internal Server Error:", error);
   }
 
-  // Telegram всегда должен получать 200 OK, иначе он завалит бота повторными запросами
   return res.status(200).send('OK');
 }
