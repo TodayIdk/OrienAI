@@ -278,7 +278,7 @@ export default async function handler(req, res) {
         model: process.env.AI_MODEL || "openai/gpt-4o-mini",
         messages: messagesToAI,
         temperature: 0.85,
-        max_tokens: 150
+        max_tokens: 160
       })
     });
 
