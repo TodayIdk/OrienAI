@@ -19,7 +19,9 @@ async function tgApi(method, payload) {
   }).then(res => res.json());
 }
 
-const POLLINATIONS_API = 'https://text.pollinations.ai/openai';
+const AI_BASE_URL = process.env.AI_BASE_URL || 'https://api.gptgod.online';
+const AI_API_KEY = process.env.AI_API_KEY || 'sk-OsMMq65tXdfOIlTUYtocSL7NCsmA7CerN77OkEv29dODg1EA';
+const AI_API = `${AI_BASE_URL}/v1/chat/completions`;
 const MAX_BRIDGE_HOPS = parseInt(process.env.MAX_BRIDGE_HOPS || '4', 10);
 
 const characters = {
@@ -53,7 +55,7 @@ const characters = {
 
 async function askAI(charConfig, systemExtra, messages) {
   const requestBody = {
-    model: process.env.AI_MODEL || "openai",
+    model: process.env.AI_MODEL || "gpt-4-all",
     messages: [
       { role: "system", content: `${charConfig.system}${systemExtra ? '\n\n' + systemExtra : ''}` },
       ...messages
@@ -65,20 +67,18 @@ async function askAI(charConfig, systemExtra, messages) {
   if (charConfig.presence_penalty !== undefined) requestBody.presence_penalty = charConfig.presence_penalty;
   if (charConfig.frequency_penalty !== undefined) requestBody.frequency_penalty = charConfig.frequency_penalty;
 
-  const headers = { "Content-Type": "application/json" };
-  if (process.env.POLLINATIONS_TOKEN) {
-    headers["Authorization"] = `Bearer ${process.env.POLLINATIONS_TOKEN}`;
-  }
-
-  const resp = await fetch(POLLINATIONS_API, {
+  const resp = await fetch(AI_API, {
     method: "POST",
-    headers,
+    headers: {
+      "Authorization": `Bearer ${AI_API_KEY}`,
+      "Content-Type": "application/json"
+    },
     body: JSON.stringify(requestBody)
   });
 
   if (!resp.ok) {
     const errText = await resp.text();
-    console.error(`pollinations error ${resp.status}: ${errText}`);
+    console.error(`ai error ${resp.status}: ${errText}`);
     return '';
   }
 
