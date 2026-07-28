@@ -50,6 +50,62 @@ const characters = {
   }
 };
 
+const MAX_BRIDGE_HOPS = parseInt(process.env.MAX_BRIDGE_HOPS || '4', 10);
+
+async function askAIForBridge(charConfig, extraSystem, userText) {
+  const requestBody = {
+    model: process.env.AI_MODEL || "openai/gpt-4o-mini",
+    messages: [
+      { role: "system", content: `${charConfig.system}\n\n${extraSystem}` },
+      { role: "user", content: userText }
+    ],
+    temperature: charConfig.temperature ?? 0.85,
+    max_tokens: charConfig.max_tokens ?? 120
+  };
+
+  if (charConfig.presence_penalty !== undefined) requestBody.presence_penalty = charConfig.presence_penalty;
+  if (charConfig.frequency_penalty !== undefined) requestBody.frequency_penalty = charConfig.frequency_penalty;
+
+  const resp = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${process.env.OPENROUTER_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(requestBody)
+  });
+
+  const data = await resp.json();
+  return data.choices?.[0]?.message?.content?.trim() || '';
+}
+
+async function sendToVex(chatId, text, hop) {
+  const url = process.env.VEX_WEBHOOK;
+  const secret = process.env.BRIDGE_SECRET;
+  if (!url || !secret) return;
+  if (hop > MAX_BRIDGE_HOPS) return;
+
+  try {
+    await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-bridge-secret': secret,
+        'x-bridge-hop': String(hop),
+        'x-bridge-from': 'orien'
+      },
+      body: JSON.stringify({
+        bridge: true,
+        chat_id: chatId,
+        from_name: 'Ориен',
+        text
+      })
+    });
+  } catch (e) {
+    console.error('bridge send error:', e);
+  }
+}
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     return res.status(200).json({ status: 'OrienAI is active' });
@@ -57,6 +113,37 @@ export default async function handler(req, res) {
 
   try {
     const update = req.body;
+
+    // --- 0. BRIDGE от векса ---
+    if (update?.bridge === true) {
+      const bridgeSecret = req.headers['x-bridge-secret'];
+      const BRIDGE_SECRET = process.env.BRIDGE_SECRET;
+
+      if (!BRIDGE_SECRET || bridgeSecret !== BRIDGE_SECRET) {
+        return res.status(401).send('bad bridge secret');
+      }
+
+      const hop = parseInt(req.headers['x-bridge-hop'] || '1', 10);
+      const { chat_id, from_name, text } = update;
+
+      if (!chat_id || !text) return res.status(200).send('OK');
+
+      await tgApi("sendChatAction", { chat_id, action: "typing" });
+
+      const charConfig = characters.orien;
+      const extraSystem = `ВАЖНО: сейчас с тобой в чате говорит твой сын ВЕКС. тот самый которого ты искал. реагируй как ориен — злоба, обида, воспоминания, угрозы. не игнорь.`;
+      const userText = `Векс только что написал в чат: "${text}". ответь ему.`;
+
+      const replyText = await askAIForBridge(charConfig, extraSystem, userText) || 'че ты бля...';
+
+      await tgApi("sendMessage", { chat_id, text: replyText });
+
+      if (hop < MAX_BRIDGE_HOPS) {
+        await sendToVex(chat_id, replyText, hop + 1);
+      }
+
+      return res.status(200).send('OK');
+    }
 
     // --- 1. Inline-кнопки (/settings) ---
     if (update.callback_query) {
@@ -68,7 +155,7 @@ export default async function handler(req, res) {
       if (mongoUri) {
         const client = await connectToDatabase(mongoUri);
         const db = client.db("orien_bot_db");
-        
+
         if (data.startsWith("set_char_")) {
           const newChar = data.replace("set_char_", "");
           await db.collection("settings").updateOne(
@@ -119,7 +206,6 @@ export default async function handler(req, res) {
     }
 
     // --- 3. ТЕХНИЧЕСКИЕ КОМАНДЫ ---
-
     if (userText === '/start') {
       await tgApi("sendMessage", { chat_id: chatId, text: "че надо падла пиши давай или жми /settings" });
       return res.status(200).send('OK');
@@ -270,11 +356,9 @@ export default async function handler(req, res) {
       }));
     }
 
-    // Выбор конфига выбранного характера
     const charConfig = characters[personaType] || characters.orien;
     const SYSTEM_PROMPT = `${charConfig.system}\nСобеседник: ${firstName} (${username}). Память: ${customMemories.join(",")}`;
 
-    // Сборка параметров запроса
     const requestBody = {
       model: process.env.AI_MODEL || "openai/gpt-4o-mini",
       messages: [
@@ -286,12 +370,8 @@ export default async function handler(req, res) {
       max_tokens: charConfig.max_tokens ?? 100
     };
 
-    if (charConfig.presence_penalty !== undefined) {
-      requestBody.presence_penalty = charConfig.presence_penalty;
-    }
-    if (charConfig.frequency_penalty !== undefined) {
-      requestBody.frequency_penalty = charConfig.frequency_penalty;
-    }
+    if (charConfig.presence_penalty !== undefined) requestBody.presence_penalty = charConfig.presence_penalty;
+    if (charConfig.frequency_penalty !== undefined) requestBody.frequency_penalty = charConfig.frequency_penalty;
 
     const openRouterResponse = await fetch("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
@@ -321,6 +401,12 @@ export default async function handler(req, res) {
       chat_id: chatId,
       text: replyText
     });
+
+    // --- 6. МОСТ К ВЕКСУ ---
+    // если юзер упомянул векса — ориен после своего ответа дёрнет векса
+    if (personaType === 'orien' && /векс|vex/i.test(userText) && process.env.VEX_WEBHOOK) {
+      await sendToVex(chatId, replyText, 1);
+    }
 
   } catch (error) {
     console.error("Internal Server Error:", error);
