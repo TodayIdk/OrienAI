@@ -19,6 +19,9 @@ async function tgApi(method, payload) {
   }).then(res => res.json());
 }
 
+const POLLINATIONS_API = 'https://text.pollinations.ai/openai';
+const MAX_BRIDGE_HOPS = parseInt(process.env.MAX_BRIDGE_HOPS || '4', 10);
+
 const characters = {
   orien: {
     system: `ты ориен, под 50, вор в законе, сидел два срока. судимость, понятия, блатная романтика — вся хуйня. у тебя есть сын векс. он щас в чате где-то тусуется. ты его любишь, но по понятиям любить — значит воспитывать, а воспитывать — значит пиздить словом. ты его подкалываешь постоянно, особенно любишь вспоминать как он в 6 лет обоссал кровать после того как ему приснился страшный сон. или как он в 8 обосрался когда гусь за ним погнался. это твой способ проявлять заботу.
@@ -48,14 +51,12 @@ const characters = {
   }
 };
 
-const MAX_BRIDGE_HOPS = parseInt(process.env.MAX_BRIDGE_HOPS || '4', 10);
-
-async function askAIForBridge(charConfig, extraSystem, userText) {
+async function askAI(charConfig, systemExtra, messages) {
   const requestBody = {
-    model: process.env.AI_MODEL || "openai/gpt-4o-mini",
+    model: process.env.AI_MODEL || "openai",
     messages: [
-      { role: "system", content: `${charConfig.system}\n\n${extraSystem}` },
-      { role: "user", content: userText }
+      { role: "system", content: `${charConfig.system}${systemExtra ? '\n\n' + systemExtra : ''}` },
+      ...messages
     ],
     temperature: charConfig.temperature ?? 0.85,
     max_tokens: charConfig.max_tokens ?? 120
@@ -64,14 +65,22 @@ async function askAIForBridge(charConfig, extraSystem, userText) {
   if (charConfig.presence_penalty !== undefined) requestBody.presence_penalty = charConfig.presence_penalty;
   if (charConfig.frequency_penalty !== undefined) requestBody.frequency_penalty = charConfig.frequency_penalty;
 
-  const resp = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+  const headers = { "Content-Type": "application/json" };
+  if (process.env.POLLINATIONS_TOKEN) {
+    headers["Authorization"] = `Bearer ${process.env.POLLINATIONS_TOKEN}`;
+  }
+
+  const resp = await fetch(POLLINATIONS_API, {
     method: "POST",
-    headers: {
-      "Authorization": `Bearer ${process.env.OPENROUTER_API_KEY}`,
-      "Content-Type": "application/json"
-    },
+    headers,
     body: JSON.stringify(requestBody)
   });
+
+  if (!resp.ok) {
+    const errText = await resp.text();
+    console.error(`pollinations error ${resp.status}: ${errText}`);
+    return '';
+  }
 
   const data = await resp.json();
   return data.choices?.[0]?.message?.content?.trim() || '';
@@ -129,10 +138,10 @@ export default async function handler(req, res) {
       await tgApi("sendChatAction", { chat_id, action: "typing" });
 
       const charConfig = characters.orien;
-      const extraSystem = `ВАЖНО: сейчас с тобой в чате говорит твой сын ВЕКС. тот самый которого ты искал. реагируй как ориен — злоба, обида, воспоминания, угрозы. не игнорь.`;
-      const userText = `Векс только что написал в чат: "${text}". ответь ему.`;
+      const extraSystem = `ВАЖНО: сейчас с тобой в чате пишет твой сын ВЕКС. он вырос, дерзкий, отвечает коротко. подкалывай его, вспоминай позорные детские истории, наезжай по-отцовски. не сдерживайся.`;
+      const userMessage = `Векс только что написал: "${text}". ответь ему как ориен.`;
 
-      const replyText = await askAIForBridge(charConfig, extraSystem, userText);
+      const replyText = (await askAI(charConfig, extraSystem, [{ role: 'user', content: userMessage }])) || 'че ты бля...';
 
       await tgApi("sendMessage", { chat_id, text: replyText });
 
@@ -355,33 +364,12 @@ export default async function handler(req, res) {
     }
 
     const charConfig = characters[personaType] || characters.orien;
-    const SYSTEM_PROMPT = `${charConfig.system}\nСобеседник: ${firstName} (${username}). Память: ${customMemories.join(",")}`;
+    const extraSystem = `Собеседник: ${firstName} (${username}). Память: ${customMemories.join(",")}`;
 
-    const requestBody = {
-      model: process.env.AI_MODEL || "openai/gpt-4o-mini",
-      messages: [
-        { role: "system", content: SYSTEM_PROMPT },
-        ...history,
-        { role: "user", content: userText }
-      ],
-      temperature: charConfig.temperature ?? 0.85,
-      max_tokens: charConfig.max_tokens ?? 100
-    };
-
-    if (charConfig.presence_penalty !== undefined) requestBody.presence_penalty = charConfig.presence_penalty;
-    if (charConfig.frequency_penalty !== undefined) requestBody.frequency_penalty = charConfig.frequency_penalty;
-
-    const openRouterResponse = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${process.env.OPENROUTER_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(requestBody)
-    });
-
-    const aiData = await openRouterResponse.json();
-    const replyText = aiData.choices?.[0]?.message?.content;
+    const replyText = (await askAI(charConfig, extraSystem, [
+      ...history,
+      { role: 'user', content: userText }
+    ])) || 'че ты бля... молчи нах';
 
     if (db) {
       await db.collection("user_tokens").updateOne(
@@ -401,7 +389,6 @@ export default async function handler(req, res) {
     });
 
     // --- 6. МОСТ К ВЕКСУ ---
-    // если юзер упомянул векса — ориен после своего ответа дёрнет векса
     if (personaType === 'orien' && /векс|vex/i.test(userText) && process.env.VEX_WEBHOOK) {
       await sendToVex(chatId, replyText, 1);
     }
