@@ -6,11 +6,6 @@ async function connectToDatabase(uri) {
   // Очищаем URI от случайных кавычек и лишних пробелов
   const cleanUri = uri ? uri.trim().replace(/^["']|["']$/g, '') : '';
 
-  if (!cleanUri || (!cleanUri.startsWith('mongodb://') && !cleanUri.startsWith('mongodb+srv://'))) {
-    console.error("[MongoDB Warning] MONGODB_URI пустой или имеет неверный формат!");
-    return null;
-  }
-
   if (cachedClient) return cachedClient;
 
   try {
