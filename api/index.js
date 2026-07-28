@@ -49,12 +49,48 @@ const characters = {
 };
 
 const MAX_BRIDGE_HOPS = parseInt(process.env.MAX_BRIDGE_HOPS || '4', 10);
+const HISTORY_LIMIT = 8;
 
-async function askAIForBridge(charConfig, extraSystem, userText) {
+async function getDb() {
+  const mongoUri = process.env.MONGODB_URI;
+  if (!mongoUri) return null;
+  try {
+    const client = await connectToDatabase(mongoUri);
+    return client.db("orien_bot_db");
+  } catch (e) {
+    console.error("MongoDB Error:", e);
+    return null;
+  }
+}
+
+async function loadHistory(db, chatId, limit = HISTORY_LIMIT) {
+  if (!db) return [];
+  const previousMessages = await db.collection("chat_history")
+    .find({ chatId })
+    .sort({ timestamp: -1 })
+    .limit(limit)
+    .toArray();
+
+  return previousMessages.reverse().map(doc => ({
+    role: doc.role,
+    content: doc.content
+  }));
+}
+
+async function saveHistory(db, chatId, userId, userContent, assistantContent) {
+  if (!db) return;
+  await db.collection("chat_history").insertMany([
+    { chatId, userId, role: "user", content: userContent, timestamp: new Date() },
+    { chatId, userId, role: "assistant", content: assistantContent, timestamp: new Date() }
+  ]);
+}
+
+async function askAI(charConfig, extraSystem, history, userText) {
   const requestBody = {
     model: process.env.AI_MODEL || "openai/gpt-4o-mini",
     messages: [
-      { role: "system", content: `${charConfig.system}\n\n${extraSystem}` },
+      { role: "system", content: `${charConfig.system}${extraSystem ? '\n\n' + extraSystem : ''}` },
+      ...history,
       { role: "user", content: userText }
     ],
     temperature: charConfig.temperature ?? 0.85,
@@ -72,6 +108,12 @@ async function askAIForBridge(charConfig, extraSystem, userText) {
     },
     body: JSON.stringify(requestBody)
   });
+
+  if (!resp.ok) {
+    const errText = await resp.text();
+    console.error(`openrouter error ${resp.status}: ${errText}`);
+    return '';
+  }
 
   const data = await resp.json();
   return data.choices?.[0]?.message?.content?.trim() || '';
@@ -111,6 +153,7 @@ export default async function handler(req, res) {
 
   try {
     const update = req.body;
+    const db = await getDb();
 
     // --- 0. BRIDGE от векса ---
     if (update?.bridge === true) {
@@ -128,13 +171,17 @@ export default async function handler(req, res) {
 
       await tgApi("sendChatAction", { chat_id, action: "typing" });
 
+      const history = await loadHistory(db, chat_id);
       const charConfig = characters.orien;
-      const extraSystem = `ВАЖНО: сейчас с тобой в чате говорит твой сын ВЕКС. тот самый которого ты искал. реагируй как ориен — злоба, обида, воспоминания, угрозы. не игнорь.`;
-      const userText = `Векс только что написал в чат: "${text}". ответь ему.`;
+      const extraSystem = `ВАЖНО: сейчас с тобой в чате пишет твой сын ВЕКС. подкалывай его, вспоминай позорные детские истории, наезжай по-отцовски. не сдерживайся.`;
+      const userText = `Векс написал: "${text}"`;
 
-      const replyText = await askAIForBridge(charConfig, extraSystem, userText) || 'че ты бля...';
+      const replyText = (await askAI(charConfig, extraSystem, history, userText)) || 'че ты бля...';
 
       await tgApi("sendMessage", { chat_id, text: replyText });
+
+      // сохраняем в общую историю чата
+      await saveHistory(db, chat_id, 'vex_bot', userText, replyText);
 
       if (hop < MAX_BRIDGE_HOPS) {
         await sendToVex(chat_id, replyText, hop + 1);
@@ -149,22 +196,16 @@ export default async function handler(req, res) {
       const chatId = cb.message.chat.id;
       const data = cb.data;
 
-      const mongoUri = process.env.MONGODB_URI;
-      if (mongoUri) {
-        const client = await connectToDatabase(mongoUri);
-        const db = client.db("orien_bot_db");
+      if (db && data.startsWith("set_char_")) {
+        const newChar = data.replace("set_char_", "");
+        await db.collection("settings").updateOne(
+          { chatId },
+          { $set: { persona: newChar, updatedAt: new Date() } },
+          { upsert: true }
+        );
 
-        if (data.startsWith("set_char_")) {
-          const newChar = data.replace("set_char_", "");
-          await db.collection("settings").updateOne(
-            { chatId },
-            { $set: { persona: newChar, updatedAt: new Date() } },
-            { upsert: true }
-          );
-
-          await tgApi("answerCallbackQuery", { callback_query_id: cb.id, text: "Характер изменен!" });
-          await tgApi("sendMessage", { chat_id: chatId, text: `Характер сменен на: **${newChar.toUpperCase()}**` });
-        }
+        await tgApi("answerCallbackQuery", { callback_query_id: cb.id, text: "Характер изменен!" });
+        await tgApi("sendMessage", { chat_id: chatId, text: `Характер сменен на: **${newChar.toUpperCase()}**` });
       }
       return res.status(200).send('OK');
     }
@@ -181,18 +222,6 @@ export default async function handler(req, res) {
     const userId = message.from?.id || 'неизвестно';
     const username = message.from?.username ? `@${message.from.username}` : '';
     const firstName = message.from?.first_name || 'Чувак';
-
-    const mongoUri = process.env.MONGODB_URI;
-    let db = null;
-
-    if (mongoUri) {
-      try {
-        const client = await connectToDatabase(mongoUri);
-        db = client.db("orien_bot_db");
-      } catch (dbErr) {
-        console.error("MongoDB Error:", dbErr);
-      }
-    }
 
     // --- 2. Фильтр срабатывания в группах ---
     const botUsername = process.env.BOT_USERNAME || "OrienBot";
@@ -331,7 +360,6 @@ export default async function handler(req, res) {
 
     let personaType = "orien";
     let customMemories = [];
-    let history = [];
 
     if (db) {
       const setDoc = await db.collection("settings").findOne({ chatId });
@@ -341,59 +369,22 @@ export default async function handler(req, res) {
 
       const memDoc = await db.collection("memories").findOne({ chatId });
       if (memDoc?.facts) customMemories = memDoc.facts;
-
-      const previousMessages = await db.collection("chat_history")
-        .find({ chatId })
-        .sort({ timestamp: -1 })
-        .limit(3)
-        .toArray();
-
-      history = previousMessages.reverse().map(doc => ({
-        role: doc.role,
-        content: doc.content
-      }));
     }
 
+    const history = await loadHistory(db, chatId);
     const charConfig = characters[personaType] || characters.orien;
-    const SYSTEM_PROMPT = `${charConfig.system}\nСобеседник: ${firstName} (${username}). Память: ${customMemories.join(",")}`;
+    const extraSystem = `Собеседник: ${firstName} (${username}). Память о нём: ${customMemories.join(", ") || 'пусто'}`;
 
-    const requestBody = {
-      model: process.env.AI_MODEL || "openai/gpt-4o-mini",
-      messages: [
-        { role: "system", content: SYSTEM_PROMPT },
-        ...history,
-        { role: "user", content: userText }
-      ],
-      temperature: charConfig.temperature ?? 0.85,
-      max_tokens: charConfig.max_tokens ?? 100
-    };
-
-    if (charConfig.presence_penalty !== undefined) requestBody.presence_penalty = charConfig.presence_penalty;
-    if (charConfig.frequency_penalty !== undefined) requestBody.frequency_penalty = charConfig.frequency_penalty;
-
-    const openRouterResponse = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${process.env.OPENROUTER_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(requestBody)
-    });
-
-    const aiData = await openRouterResponse.json();
-    const replyText = aiData.choices?.[0]?.message?.content || "че надо бля... молчи нах";
+    const replyText = (await askAI(charConfig, extraSystem, history, userText)) || "че надо бля... молчи нах";
 
     if (db) {
       await db.collection("user_tokens").updateOne(
         { chatId },
         { $inc: { tokens: -1 } }
       );
-
-      await db.collection("chat_history").insertMany([
-        { chatId, userId, role: "user", content: userText, timestamp: new Date() },
-        { chatId, userId, role: "assistant", content: replyText, timestamp: new Date() }
-      ]);
     }
+
+    await saveHistory(db, chatId, userId, userText, replyText);
 
     await tgApi("sendMessage", {
       chat_id: chatId,
@@ -401,7 +392,6 @@ export default async function handler(req, res) {
     });
 
     // --- 6. МОСТ К ВЕКСУ ---
-    // если юзер упомянул векса — ориен после своего ответа дёрнет векса
     if (personaType === 'orien' && /векс|vex/i.test(userText) && process.env.VEX_WEBHOOK) {
       await sendToVex(chatId, replyText, 1);
     }
